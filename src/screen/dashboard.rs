@@ -689,6 +689,7 @@ impl Dashboard {
                                         if let data::layout::pane::VisualConfig::Heatmap(h_cfg) =
                                             &cfg
                                         {
+                                            let _ = state.apply_heatmap_sync_basis(*h_cfg);
                                             let (changed, fetch_stream) =
                                                 state.update_heatmap_overlay_streams(*h_cfg);
                                             if changed {
@@ -724,6 +725,7 @@ impl Dashboard {
                         state.content.change_visual_config(cfg.clone());
 
                         if let data::layout::pane::VisualConfig::Heatmap(h_cfg) = &cfg {
+                            let _ = state.apply_heatmap_sync_basis(*h_cfg);
                             let (changed, fetch_stream) =
                                 state.update_heatmap_overlay_streams(*h_cfg);
                             if changed {

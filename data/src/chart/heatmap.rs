@@ -25,6 +25,9 @@ pub struct Config {
     /// Overrides the kline timeframe used for the candle overlay.
     #[serde(default)]
     pub candle_timeframe: Option<Timeframe>,
+    /// Keep heatmap aggregation aligned with the candle timeframe.
+    #[serde(default)]
+    pub sync_heatmap_to_candles: bool,
 }
 
 impl Default for Config {
@@ -36,6 +39,7 @@ impl Default for Config {
             coalescing: Some(CoalesceKind::Average(0.15)),
             show_candles: false,
             candle_timeframe: None,
+            sync_heatmap_to_candles: false,
         }
     }
 }

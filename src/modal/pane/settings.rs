@@ -286,7 +286,7 @@ pub fn heatmap_cfg_view<'a>(
         )
     });
 
-    let candle_tf_picker = if cfg.show_candles {
+    let candle_tf_picker: Option<Element<'a, Message>> = if cfg.show_candles {
         match basis {
             data::chart::Basis::Time(tf) => {
                 let default_tf = heatmap::default_candle_timeframe(tf);
@@ -311,9 +311,40 @@ pub fn heatmap_cfg_view<'a>(
         None
     };
 
+    let sync_toggle: Option<Element<'a, Message>> = if cfg.show_candles {
+        let enabled = cfg.sync_heatmap_to_candles;
+        let fallback_tf = default_candle_tf.unwrap_or(Timeframe::M5);
+        Some(
+            checkbox(enabled)
+                .label("Sync heatmap aggregation to candle timeframe")
+                .on_toggle(move |v| {
+                    let candle_timeframe = if v {
+                        cfg.candle_timeframe.or(Some(fallback_tf))
+                    } else {
+                        cfg.candle_timeframe
+                    };
+                    Message::VisualConfigChanged(
+                        pane,
+                        VisualConfig::Heatmap(heatmap::Config {
+                            sync_heatmap_to_candles: v,
+                            candle_timeframe,
+                            ..cfg
+                        }),
+                        false,
+                    )
+                })
+                .into(),
+        )
+    } else {
+        None
+    };
+
     let mut overlay_column = column![text("Overlay").size(14), candles_toggle].spacing(8);
     if let Some(picker) = candle_tf_picker {
         overlay_column = overlay_column.push(picker);
+    }
+    if let Some(toggle) = sync_toggle {
+        overlay_column = overlay_column.push(toggle);
     }
 
     let content = split_column![

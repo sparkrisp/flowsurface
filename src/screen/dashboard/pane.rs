@@ -676,7 +676,23 @@ impl State {
             self.settings.tick_multiply,
         );
 
-        self.settings.selected_basis = derived_plan.basis;
+        let mut selected_basis = derived_plan.basis;
+        let heatmap_cfg = match kind {
+            ContentKind::HeatmapChart | ContentKind::CandlesHeatmapChart => {
+                let cfg = self.settings.visual_config.clone().and_then(|cfg| cfg.heatmap());
+                if let Some(cfg) = cfg {
+                    if cfg.show_candles && cfg.sync_heatmap_to_candles {
+                        if let Some(tf) = resolve_heatmap_candle_tf(cfg, selected_basis) {
+                            selected_basis = Some(Basis::Time(tf));
+                        }
+                    }
+                }
+                cfg
+            }
+            _ => None,
+        };
+
+        self.settings.selected_basis = selected_basis;
         self.settings.tick_multiply = derived_plan.tick_multiplier;
 
         let (content, streams) = {
@@ -700,24 +716,18 @@ impl State {
                     );
 
                     let streams = {
-                        let heatmap_cfg = self.settings.visual_config.clone().and_then(|cfg| cfg.heatmap());
                         let wants_candles = heatmap_cfg.map(|c| c.show_candles).unwrap_or(false);
-                        if wants_candles {
-                            by_basis_default(
-                                derived_plan.basis,
-                                Timeframe::M5,
-                                |tf| {
-                                    let default_tf = data::chart::heatmap::default_candle_timeframe(tf);
-                                    let k_tf = heatmap_cfg
-                                        .and_then(|cfg| cfg.candle_timeframe)
-                                        .unwrap_or(default_tf);
-                                    vec![
-                                        depth_stream(&derived_plan),
-                                        kline_stream(derived_plan.ticker_info, k_tf),
-                                    ]
-                                },
-                                || vec![depth_stream(&derived_plan)],
-                            )
+                        let candle_tf = heatmap_cfg
+                            .and_then(|cfg| resolve_heatmap_candle_tf(cfg, selected_basis));
+                        if wants_candles && matches!(selected_basis, Some(Basis::Time(_))) {
+                            if let Some(k_tf) = candle_tf {
+                                vec![
+                                    depth_stream(&derived_plan),
+                                    kline_stream(derived_plan.ticker_info, k_tf),
+                                ]
+                            } else {
+                                vec![depth_stream(&derived_plan)]
+                            }
                         } else {
                             vec![depth_stream(&derived_plan)]
                         }
@@ -850,14 +860,7 @@ impl State {
         &mut self,
         cfg: data::chart::heatmap::Config,
     ) -> (bool, Option<StreamKind>) {
-        let basis = self.settings.selected_basis;
-        let desired_tf = match (cfg.show_candles, basis) {
-            (true, Some(Basis::Time(tf))) => {
-                let default_tf = data::chart::heatmap::default_candle_timeframe(tf);
-                Some(cfg.candle_timeframe.unwrap_or(default_tf))
-            }
-            _ => None,
-        };
+        let desired_tf = resolve_heatmap_candle_tf(cfg, self.settings.selected_basis);
         let base_ticker = self.stream_pair();
 
         let mut changed = false;
@@ -898,6 +901,28 @@ impl State {
         }
 
         (changed, fetch_stream)
+    }
+
+    pub fn apply_heatmap_sync_basis(&mut self, cfg: data::chart::heatmap::Config) -> bool {
+        if !cfg.sync_heatmap_to_candles || !cfg.show_candles {
+            return false;
+        }
+
+        let Some(tf) = resolve_heatmap_candle_tf(cfg, self.settings.selected_basis) else {
+            return false;
+        };
+        let desired_basis = Basis::Time(tf);
+
+        if self.settings.selected_basis == Some(desired_basis) {
+            return false;
+        }
+
+        self.settings.selected_basis = Some(desired_basis);
+        if let Content::Heatmap { chart: Some(c), .. } = &mut self.content {
+            c.set_basis(desired_basis);
+        }
+
+        true
     }
 
     pub fn insert_hist_oi(&mut self, req_id: Option<uuid::Uuid>, oi: &[OpenInterest]) {
@@ -3592,4 +3617,24 @@ fn by_basis_default<T>(
         Basis::Time(tf) => on_time(tf),
         Basis::Tick(_) => on_tick(),
     }
+}
+
+fn resolve_heatmap_candle_tf(
+    cfg: data::chart::heatmap::Config,
+    basis: Option<Basis>,
+) -> Option<Timeframe> {
+    if !cfg.show_candles {
+        return None;
+    }
+
+    if let Some(tf) = cfg.candle_timeframe {
+        return Some(tf);
+    }
+
+    let basis_tf = match basis {
+        Some(Basis::Time(tf)) => tf,
+        _ => Timeframe::M5,
+    };
+
+    Some(data::chart::heatmap::default_candle_timeframe(basis_tf))
 }
