@@ -33,6 +33,7 @@ use iced::{
 
 use enum_map::EnumMap;
 use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 const MIN_SCALING: f32 = 0.6;
@@ -152,6 +153,7 @@ pub struct HeatmapChart {
     indicators: EnumMap<HeatmapIndicator, Option<IndicatorData>>,
     pause_buffer: Vec<(u64, Box<[Trade]>, Depth)>,
     heatmap: HistoricalDepth,
+    klines: BTreeMap<u64, exchange::Kline>,
     visual_config: Config,
     study_configurator: study::Configurator<HeatmapStudy>,
     last_tick: Instant,
@@ -197,12 +199,33 @@ impl HeatmapChart {
             indicators,
             pause_buffer: vec![],
             heatmap,
+            klines: BTreeMap::new(),
             trades: TimeSeries::<HeatmapDataPoint>::new(basis, step),
             visual_config: config.unwrap_or_default(),
             study_configurator: study::Configurator::new(),
             studies,
             last_tick: Instant::now(),
         }
+    }
+
+    pub fn on_insert_klines(&mut self, klines: &[exchange::Kline]) {
+        let aggr_time: u64 = match self.chart.basis {
+            Basis::Time(interval) => interval.into(),
+            Basis::Tick(_) => return,
+        };
+        for k in klines {
+            let t = (k.time / aggr_time) * aggr_time;
+            self.klines.insert(t, k.clone());
+        }
+        const MAX: usize = 6000;
+        if self.klines.len() > MAX {
+            let drain = self.klines.len().saturating_sub(MAX);
+            let keys: Vec<u64> = self.klines.keys().take(drain).copied().collect();
+            for k in keys {
+                self.klines.remove(&k);
+            }
+        }
+        self.chart.cache.clear_all();
     }
 
     pub fn insert_datapoint(
@@ -215,6 +238,60 @@ impl HeatmapChart {
 
         let mid_price = depth.mid_price().unwrap_or(chart.base_price_y);
         chart.last_price = Some(PriceInfoLabel::Neutral(mid_price));
+
+        // Candlestick overlay (beta): build micro-candles from the trades stream so the overlay is
+        // visible even when the heatmap basis is sub-second (MS100..MS1000), where exchange klines
+        // don't exist.
+        if self.visual_config.show_candles {
+            if let Basis::Time(tf) = chart.basis {
+                let interval_ms = tf.to_milliseconds().max(1);
+                let t = (depth_update_t / interval_ms) * interval_ms;
+
+                if !trades_buffer.is_empty() {
+                    let open = trades_buffer.first().unwrap().price;
+                    let close = trades_buffer.last().unwrap().price;
+                    let mut high = open;
+                    let mut low = open;
+                    let mut buy_qty = 0.0f32;
+                    let mut sell_qty = 0.0f32;
+
+                    for tr in trades_buffer {
+                        if tr.price > high {
+                            high = tr.price;
+                        }
+                        if tr.price < low {
+                            low = tr.price;
+                        }
+                        if tr.is_sell {
+                            sell_qty += tr.qty;
+                        } else {
+                            buy_qty += tr.qty;
+                        }
+                    }
+
+                    self.klines.insert(
+                        t,
+                        exchange::Kline {
+                            time: t,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume: (buy_qty, sell_qty),
+                        },
+                    );
+
+                    const MAX: usize = 60_000;
+                    if self.klines.len() > MAX {
+                        let drain = self.klines.len().saturating_sub(MAX);
+                        let keys: Vec<u64> = self.klines.keys().take(drain).copied().collect();
+                        for k in keys {
+                            self.klines.remove(&k);
+                        }
+                    }
+                }
+            }
+        }
 
         // if current orderbook not visible, pause the data insertion and buffer them instead
         let is_paused = { chart.translation.x * chart.scaling > chart.bounds.width / 2.0 };
@@ -676,6 +753,53 @@ impl canvas::Program<Message> for HeatmapChart {
                         );
                     }
                 });
+
+            // Candlestick overlay (beta): draw Kline candles on top of heatmap.
+            if self.visual_config.show_candles {
+                let candle_width = (chart.cell_width * 0.9).max(0.5);
+                let half_w = candle_width / 2.0;
+                let wick_w = (candle_width * 0.25).max(0.2);
+
+                for (t, k) in self.klines.range(earliest..=latest) {
+                    let x = chart.interval_to_x(*t);
+
+                    // keep within visible region on x; heatmap uses negative x for left scroll
+                    if x < region.x - region.width || x > region.x + region.width {
+                        continue;
+                    }
+
+                    let open_y = chart.price_to_y(k.open);
+                    let close_y = chart.price_to_y(k.close);
+                    let high_y = chart.price_to_y(k.high);
+                    let low_y = chart.price_to_y(k.low);
+
+                    let is_up = k.close >= k.open;
+                    let body_color = if is_up {
+                        palette.success.base.color
+                    } else {
+                        palette.danger.base.color
+                    }
+                    .scale_alpha(0.85);
+
+                    let x_left = x - half_w;
+                    let body_top = open_y.min(close_y);
+                    let body_h = (open_y - close_y).abs().max(0.8);
+
+                    // wick
+                    frame.fill_rectangle(
+                        Point::new(x - wick_w / 2.0, high_y.min(low_y)),
+                        Size::new(wick_w, (high_y - low_y).abs().max(0.6)),
+                        body_color.scale_alpha(0.7),
+                    );
+
+                    // body
+                    frame.fill_rectangle(
+                        Point::new(x_left, body_top),
+                        Size::new(candle_width, body_h),
+                        body_color,
+                    );
+                }
+            }
 
             if volume_indicator && max_aggr_volume > 0.0 {
                 let text_size = 9.0 / chart.scaling;

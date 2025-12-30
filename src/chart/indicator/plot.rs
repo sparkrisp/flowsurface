@@ -139,10 +139,19 @@ pub struct YScale {
 
 impl YScale {
     pub fn to_y(&self, v: f32) -> f32 {
-        if self.max <= self.min {
+        if !v.is_finite()
+            || !self.min.is_finite()
+            || !self.max.is_finite()
+            || !self.px_height.is_finite()
+        {
+            return self.px_height;
+        }
+
+        let denom = self.max - self.min;
+        if denom.abs() < 1e-6 {
             self.px_height
         } else {
-            self.px_height - ((v - self.min) / (self.max - self.min)) * self.px_height
+            self.px_height - ((v - self.min) / denom) * self.px_height
         }
     }
 }
@@ -318,12 +327,19 @@ where
                 // horizontal snap uses label extents
                 let highest = self.max_for_labels;
                 let lowest = self.min_for_labels;
-                let tick = guesstimate_ticks(highest - lowest);
+                let denom = lowest - highest;
+                if !denom.is_finite() || denom.abs() < 1e-6 {
+                    return;
+                }
+                let tick = guesstimate_ticks(denom);
 
                 let ratio = cursor_position.y / bounds.height;
                 let value = highest + ratio * (lowest - highest);
                 let rounded = round_to_tick(value, tick);
-                let snap_ratio = (rounded - highest) / (lowest - highest);
+                let snap_ratio = (rounded - highest) / denom;
+                if !snap_ratio.is_finite() {
+                    return;
+                }
 
                 frame.stroke(
                     &Path::line(
@@ -353,7 +369,7 @@ where
     }
 }
 
-type TooltipFn<T> = Box<dyn Fn(&T, Option<&T>) -> PlotTooltip>;
+pub type TooltipFn<T> = Box<dyn Fn(&T, Option<&T>) -> PlotTooltip>;
 
 const TOOLTIP_MARGIN: f32 = 4.0; // px from edge of canvas
 const TOOLTIP_PADDING: f32 = 8.0; // px inside tooltip box

@@ -6,6 +6,7 @@ use crate::{
             Modal,
             mini_tickers_list::MiniPanel,
             settings::{comparison_cfg_view, heatmap_cfg_view, kline_cfg_view},
+            stack_context_menu,
             stack_modal,
         },
     },
@@ -24,6 +25,7 @@ use data::{
         indicator::{HeatmapIndicator, Indicator, KlineIndicator, UiIndicator},
     },
     layout::pane::{ContentKind, LinkGroup, PaneSetup, Settings, VisualConfig},
+    rules::{EvaluationMode, RuleAction, RuleCondition, RuleSpec},
 };
 use exchange::{
     Kline, OpenInterest, StreamPairKind, TickMultiplier, TickerInfo, Timeframe,
@@ -36,6 +38,8 @@ use iced::{
     padding,
     widget::{button, center, column, container, pane_grid, pick_list, row, text, tooltip},
 };
+use chrono::Local;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -94,6 +98,73 @@ pub enum Event {
     StreamModifierChanged(modal::stream::Message),
     ComparisonChartInteraction(super::chart::comparison::Message),
     MiniTickersListInteraction(modal::pane::mini_tickers_list::Message),
+
+    // Rules (candlestick/kline panes)
+    AddRule,
+    DeleteRule(uuid::Uuid),
+    ToggleRule(uuid::Uuid, bool),
+    ToggleRuleCard(uuid::Uuid),
+    UpdateRuleName(uuid::Uuid, String),
+    UpdateRuleEvaluation(uuid::Uuid, EvaluationMode),
+    UpdateRuleConditionKind(uuid::Uuid, modal::pane::rules::ConditionKind),
+    UpdateRuleCrossDirection(uuid::Uuid, data::rules::CrossDirection),
+    UpdateRuleCompareDirection(uuid::Uuid, data::rules::CompareDirection),
+    UpdateRuleLevel(uuid::Uuid, String),
+    ToggleRuleActionToast(uuid::Uuid, bool),
+    UpdateRuleToastMessage(uuid::Uuid, String),
+    ToggleRuleActionSound(uuid::Uuid, bool),
+    ToggleRuleActionTelegram(uuid::Uuid, bool),
+    ToggleRuleActionPush(uuid::Uuid, bool),
+    ToggleRuleActionPaperTrade(uuid::Uuid, bool),
+    UpdateRulePaperPercent(uuid::Uuid, String),
+    AddRuleAndOpen,
+    ToggleSettingsColors(SettingsColorsSection),
+    IndicatorsQueryChanged(String),
+    IndicatorsSidebarSelected(IndicatorsSidebar),
+    IndicatorsSourceSelected(IndicatorsSource),
+
+    // Rule trigger log
+    ClearRuleLog,
+
+    // Chart navigation
+    GoToLatest,
+
+    // Centered modal resizing (window-level)
+    ResizeCenteredModal(CenteredModalKind, f32, f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CenteredModalKind {
+    Rules,
+    Indicators,
+    RuleLog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingsColorsSection {
+    Rsi,
+    Macd,
+    Atr,
+    StochRsi,
+    DmiAdx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IndicatorsSidebar {
+    Enabled,
+    Volume,
+    Derivatives,
+    Oscillators,
+    Trend,
+    Volatility,
+    Overlays,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IndicatorsSource {
+    BuiltIn,
+    Community,
 }
 
 pub struct State {
@@ -105,6 +176,52 @@ pub struct State {
     pub streams: ResolvedStream,
     pub status: Status,
     pub link_group: Option<LinkGroup>,
+
+    // Rule system (per pane, currently only meaningful for kline/candlestick)
+    pub rules: Vec<RuleSpec>,
+    pub(crate) rules_expanded: Option<uuid::Uuid>,
+    pub rule_log: Vec<RuleLogEntry>,
+    pub paper: PaperAccount,
+    rule_last_triggered_ms: HashMap<uuid::Uuid, u64>,
+    pub settings_colors_expanded: HashSet<SettingsColorsSection>,
+    pub indicators_query: String,
+    pub indicators_sidebar: IndicatorsSidebar,
+    pub indicators_source: IndicatorsSource,
+    pub(crate) last_trade_price: Option<f32>,
+    pub(crate) prev_trade_price: Option<f32>,
+    pub(crate) pending_candle_close: Option<(u64, f32, f32)>, // (time, close, volume_total)
+
+    // Performance: rule evaluation throttling for OnTick (to avoid doing heavy indicator math at frame-rate)
+    pub rule_tick_dirty: bool,
+    pub rule_tick_last_eval: Instant,
+
+    // Window-level modal sizes (per pane)
+    pub centered_rules_size: (f32, f32),
+    pub centered_indicators_size: (f32, f32),
+    pub centered_rule_log_size: (f32, f32),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PaperAccount {
+    pub balance_quote: f32,
+    pub position_base: f32,
+}
+
+impl Default for PaperAccount {
+    fn default() -> Self {
+        Self {
+            balance_quote: 10_000.0,
+            position_base: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuleLogEntry {
+    pub time_hms: String,
+    pub rule_id: uuid::Uuid,
+    pub rule_name: String,
+    pub message: String,
 }
 
 impl State {
@@ -117,13 +234,399 @@ impl State {
         streams: Vec<PersistStreamKind>,
         settings: Settings,
         link_group: Option<LinkGroup>,
+        rules: Vec<RuleSpec>,
     ) -> Self {
         Self {
             content,
             settings,
             streams: ResolvedStream::Waiting(streams),
             link_group,
+            rules,
             ..Default::default()
+        }
+    }
+
+    fn upsert_action(rule: &mut RuleSpec, action: RuleAction, enabled: bool) {
+        let discr = std::mem::discriminant(&action);
+        let exists = rule.actions.iter().any(|a| std::mem::discriminant(a) == discr);
+        if enabled && !exists {
+            rule.actions.push(action);
+        } else if !enabled && exists {
+            rule.actions.retain(|a| std::mem::discriminant(a) != discr);
+        }
+    }
+
+    fn set_toast_message(rule: &mut RuleSpec, msg: String) {
+        for a in &mut rule.actions {
+            if let RuleAction::Toast { message } = a {
+                *message = msg;
+                return;
+            }
+        }
+        rule.actions.push(RuleAction::Toast { message: msg });
+    }
+
+    pub fn push_rule_log(&mut self, rule: &RuleSpec, message: String) {
+        let time_hms = Local::now().format("%H:%M:%S").to_string();
+
+        self.rule_log.push(RuleLogEntry {
+            time_hms,
+            rule_id: rule.id,
+            rule_name: rule.name.clone(),
+            message,
+        });
+
+        const MAX: usize = 1_000;
+        if self.rule_log.len() > MAX {
+            let drain = self.rule_log.len() - MAX;
+            self.rule_log.drain(0..drain);
+        }
+    }
+
+    pub fn push_notification(&mut self, toast: Toast) {
+        self.notifications.push(toast);
+        const MAX: usize = 200;
+        if self.notifications.len() > MAX {
+            let drain = self.notifications.len() - MAX;
+            self.notifications.drain(0..drain);
+        }
+    }
+
+    pub fn cooldown_allows(&mut self, rule: &RuleSpec, now_ms: u64) -> bool {
+        if rule.cooldown_ms == 0 {
+            // still store the last trigger to support future enhancements
+            self.rule_last_triggered_ms.insert(rule.id, now_ms);
+            return true;
+        }
+        if let Some(last) = self.rule_last_triggered_ms.get(&rule.id) {
+            if now_ms.saturating_sub(*last) < rule.cooldown_ms {
+                return false;
+            }
+        }
+        self.rule_last_triggered_ms.insert(rule.id, now_ms);
+        true
+    }
+
+    pub fn on_trades_buffer(&mut self, trades_buffer: &[exchange::Trade]) {
+        if let Some(last) = trades_buffer.last() {
+            self.prev_trade_price = self.last_trade_price;
+            self.last_trade_price = Some(last.price.to_f32_lossy());
+            self.rule_tick_dirty = true;
+        }
+    }
+
+    pub fn current_price(&self) -> Option<f32> {
+        self.last_trade_price
+    }
+
+    pub fn paper_trade(&mut self, side: data::rules::Side, pct: f32, price: f32) -> Option<String> {
+        if !price.is_finite() || price <= 0.0 {
+            return None;
+        }
+        let pct = pct.clamp(0.0, 100.0);
+        match side {
+            data::rules::Side::Buy => {
+                let spend = self.paper.balance_quote * (pct / 100.0);
+                if spend <= 0.0 {
+                    return None;
+                }
+                let qty = spend / price;
+                self.paper.balance_quote -= spend;
+                self.paper.position_base += qty;
+                Some(format!(
+                    "paper fill BUY {:.6} @ {:.4} (spent {:.2}, bal {:.2}, pos {:.6})",
+                    qty, price, spend, self.paper.balance_quote, self.paper.position_base
+                ))
+            }
+            data::rules::Side::Sell => {
+                let qty = self.paper.position_base * (pct / 100.0);
+                if qty <= 0.0 {
+                    return None;
+                }
+                let gain = qty * price;
+                self.paper.position_base -= qty;
+                self.paper.balance_quote += gain;
+                Some(format!(
+                    "paper fill SELL {:.6} @ {:.4} (gain {:.2}, bal {:.2}, pos {:.6})",
+                    qty, price, gain, self.paper.balance_quote, self.paper.position_base
+                ))
+            }
+        }
+    }
+
+    pub fn zoom_focused_chart(&mut self, delta_y: f32) {
+        match &mut self.content {
+            Content::Kline { chart, .. } => {
+                if let Some(c) = chart.as_mut() {
+                    crate::chart::zoom_center(c, delta_y);
+                }
+            }
+            Content::Heatmap { chart, .. } => {
+                if let Some(c) = chart.as_mut() {
+                    crate::chart::zoom_center(c, delta_y);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_kline_update(&mut self, kline: &exchange::Kline) {
+        let total_vol = kline.volume.0 + kline.volume.1;
+        self.pending_candle_close = Some((kline.time, kline.close.to_f32_lossy(), total_vol));
+    }
+
+    pub(crate) fn eval_condition_tick(&self, rule: &RuleSpec) -> bool {
+        // helper: get the kline chart if present
+        let chart = match &self.content {
+            Content::Kline { chart, .. } => chart.as_ref(),
+            _ => None,
+        };
+
+        match &rule.condition {
+            RuleCondition::PriceCrossLevel { level, direction } => {
+                let (Some(prev), Some(cur)) = (self.prev_trade_price, self.last_trade_price) else {
+                    return false;
+                };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => prev < *level && cur >= *level,
+                    data::rules::CrossDirection::CrossDown => prev > *level && cur <= *level,
+                }
+            }
+            RuleCondition::VwapCross { direction } => {
+                let Some(chart) = chart else { return false; };
+                let (Some(prev), Some(cur)) = (self.prev_trade_price, self.last_trade_price) else {
+                    return false;
+                };
+                let Some(cfg) = vwap_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some((_, vwap)) = vwap_last_two(&ohlcv, cfg.reset_daily_utc) else { return false; };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => prev < vwap && cur >= vwap,
+                    data::rules::CrossDirection::CrossDown => prev > vwap && cur <= vwap,
+                }
+            }
+            RuleCondition::SupertrendLineCross { direction } => {
+                let Some(chart) = chart else { return false; };
+                let (Some(prev), Some(cur)) = (self.prev_trade_price, self.last_trade_price) else {
+                    return false;
+                };
+                let Some(cfg) = supertrend_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some((_, (_, line))) =
+                    supertrend_last_two(&ohlcv, cfg.atr_period, cfg.multiplier_x100)
+                else {
+                    return false;
+                };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => prev < line && cur >= line,
+                    data::rules::CrossDirection::CrossDown => prev > line && cur <= line,
+                }
+            }
+            RuleCondition::DonchianBreakout { direction } => {
+                let Some(chart) = chart else { return false; };
+                let (Some(prev), Some(cur)) = (self.prev_trade_price, self.last_trade_price) else {
+                    return false;
+                };
+                let Some(cfg) = donchian_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some((_, (upper, lower))) = donchian_last_two(&ohlcv, cfg.period) else {
+                    return false;
+                };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => prev < upper && cur >= upper,
+                    data::rules::CrossDirection::CrossDown => prev > lower && cur <= lower,
+                }
+            }
+            RuleCondition::KeltnerBreakout { direction } => {
+                let Some(chart) = chart else { return false; };
+                let (Some(prev), Some(cur)) = (self.prev_trade_price, self.last_trade_price) else {
+                    return false;
+                };
+                let Some(cfg) = keltner_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some((_, (upper, lower))) = keltner_last_two(
+                    &ohlcv,
+                    cfg.ema_period,
+                    cfg.atr_period,
+                    cfg.multiplier_x100,
+                ) else {
+                    return false;
+                };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => prev < upper && cur >= upper,
+                    data::rules::CrossDirection::CrossDown => prev > lower && cur <= lower,
+                }
+            }
+            RuleCondition::MovingAverageCross { direction } => {
+                let Some(chart) = chart else { return false; };
+                let closes = chart.close_series();
+                let Some((fast, slow)) = ma_pair_from_kind(chart.kind()) else { return false; };
+
+                let Some((pf, cf)) = ma_last_two(&closes, fast.kind, fast.period) else { return false; };
+                let Some((ps, cs)) = ma_last_two(&closes, slow.kind, slow.period) else { return false; };
+
+                match direction {
+                    data::rules::CrossDirection::CrossUp => pf < ps && cf >= cs,
+                    data::rules::CrossDirection::CrossDown => pf > ps && cf <= cs,
+                }
+            }
+            RuleCondition::RsiCrossLevel { level, direction } => {
+                let Some(chart) = chart else { return false; };
+                let closes = chart.close_series();
+                let cfg = chart.visual_config();
+                let Some((prev_rsi, cur_rsi)) = rsi_last_two(&closes, cfg.rsi_period) else {
+                    return false;
+                };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => prev_rsi < *level && cur_rsi >= *level,
+                    data::rules::CrossDirection::CrossDown => prev_rsi > *level && cur_rsi <= *level,
+                }
+            }
+            RuleCondition::MacdCrossSignal { direction } => {
+                let Some(chart) = chart else { return false; };
+                let closes = chart.close_series();
+                let cfg = chart.visual_config();
+                let Some(((pm, ps), (cm, cs))) =
+                    macd_last_two(&closes, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
+                else {
+                    return false;
+                };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => pm < ps && cm >= cs,
+                    data::rules::CrossDirection::CrossDown => pm > ps && cm <= cs,
+                }
+            }
+            // event-style conditions based on candle math: evaluate only on candle close to avoid re-triggering on every tick
+            RuleCondition::SupertrendFlip { .. } | RuleCondition::DmiCross { .. } | RuleCondition::AdxIs { .. } => {
+                false
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn eval_condition_candle_close(&self, rule: &RuleSpec, _close: f32, vol: f32) -> bool {
+        let chart = match &self.content {
+            Content::Kline { chart, .. } => chart.as_ref(),
+            _ => None,
+        };
+        match &rule.condition {
+            RuleCondition::CandleCloseCrossLevel { level, direction } => {
+                let Some(chart) = chart else { return false; };
+                let Some((prev_close, cur_close)) = chart.last_two_closes() else { return false; };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => prev_close < *level && cur_close >= *level,
+                    data::rules::CrossDirection::CrossDown => prev_close > *level && cur_close <= *level,
+                }
+            }
+            RuleCondition::VolumeIs { value, direction } => match direction {
+                data::rules::CompareDirection::Above => vol >= *value,
+                data::rules::CompareDirection::Below => vol <= *value,
+            },
+            RuleCondition::VwapCross { direction } => {
+                let Some(chart) = chart else { return false; };
+                let Some(cfg) = vwap_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some((pvwap, cvwap)) = vwap_last_two(&ohlcv, cfg.reset_daily_utc) else {
+                    return false;
+                };
+                let Some((pclose, cclose)) = chart.last_two_closes() else { return false; };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => pclose < pvwap && cclose >= cvwap,
+                    data::rules::CrossDirection::CrossDown => pclose > pvwap && cclose <= cvwap,
+                }
+            }
+            RuleCondition::SupertrendFlip { direction } => {
+                let Some(chart) = chart else { return false; };
+                let Some(cfg) = supertrend_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some(((p_up, _), (c_up, _))) =
+                    supertrend_last_two(&ohlcv, cfg.atr_period, cfg.multiplier_x100)
+                else {
+                    return false;
+                };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => !p_up && c_up,
+                    data::rules::CrossDirection::CrossDown => p_up && !c_up,
+                }
+            }
+            RuleCondition::SupertrendLineCross { direction } => {
+                let Some(chart) = chart else { return false; };
+                let Some(cfg) = supertrend_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some(((_, pline), (_, cline))) =
+                    supertrend_last_two(&ohlcv, cfg.atr_period, cfg.multiplier_x100)
+                else {
+                    return false;
+                };
+                let Some((pclose, cclose)) = chart.last_two_closes() else { return false; };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => pclose < pline && cclose >= cline,
+                    data::rules::CrossDirection::CrossDown => pclose > pline && cclose <= cline,
+                }
+            }
+            RuleCondition::DonchianBreakout { direction } => {
+                let Some(chart) = chart else { return false; };
+                let Some(cfg) = donchian_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some(((pupper, plower), (cupper, clower))) = donchian_last_two(&ohlcv, cfg.period) else {
+                    return false;
+                };
+                let Some((pclose, cclose)) = chart.last_two_closes() else { return false; };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => pclose < pupper && cclose >= cupper,
+                    data::rules::CrossDirection::CrossDown => pclose > plower && cclose <= clower,
+                }
+            }
+            RuleCondition::KeltnerBreakout { direction } => {
+                let Some(chart) = chart else { return false; };
+                let Some(cfg) = keltner_cfg_from_kind(chart.kind()) else { return false; };
+                let ohlcv = chart.ohlcv_series();
+                let Some(((pupper, plower), (cupper, clower))) = keltner_last_two(
+                    &ohlcv,
+                    cfg.ema_period,
+                    cfg.atr_period,
+                    cfg.multiplier_x100,
+                ) else {
+                    return false;
+                };
+                let Some((pclose, cclose)) = chart.last_two_closes() else { return false; };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => pclose < pupper && cclose >= cupper,
+                    data::rules::CrossDirection::CrossDown => pclose > plower && cclose <= clower,
+                }
+            }
+            RuleCondition::DmiCross { direction } => {
+                let Some(chart) = chart else { return false; };
+                let cfg = chart.visual_config();
+                let ohlcv = chart.ohlcv_series();
+                let Some(((p_plus, p_minus, _), (c_plus, c_minus, _))) =
+                    dmi_adx_last_two(&ohlcv, cfg.dmi_period)
+                else {
+                    return false;
+                };
+                match direction {
+                    data::rules::CrossDirection::CrossUp => p_plus < p_minus && c_plus >= c_minus,
+                    data::rules::CrossDirection::CrossDown => p_plus > p_minus && c_plus <= c_minus,
+                }
+            }
+            RuleCondition::AdxIs { value, direction } => {
+                let Some(chart) = chart else { return false; };
+                let cfg = chart.visual_config();
+                let ohlcv = chart.ohlcv_series();
+                let Some(((_, _, p_adx), (_, _, c_adx))) = dmi_adx_last_two(&ohlcv, cfg.dmi_period) else {
+                    return false;
+                };
+                match direction {
+                    // treat as a threshold CROSS to avoid spamming every candle while condition holds
+                    data::rules::CompareDirection::Above => p_adx < *value && c_adx >= *value,
+                    data::rules::CompareDirection::Below => p_adx > *value && c_adx <= *value,
+                }
+            }
+            // for candle-close evaluation, reuse the same computations based on latest chart state
+            RuleCondition::MovingAverageCross { .. }
+            | RuleCondition::RsiCrossLevel { .. }
+            | RuleCondition::MacdCrossSignal { .. } => self.eval_condition_tick(rule),
+            _ => false,
         }
     }
 
@@ -188,7 +691,7 @@ impl State {
             };
 
             match kind {
-                ContentKind::HeatmapChart => {
+                ContentKind::HeatmapChart | ContentKind::CandlesHeatmapChart => {
                     let content = Content::new_heatmap(
                         &self.content,
                         derived_plan.ticker_info,
@@ -196,7 +699,29 @@ impl State {
                         derived_plan.tick_size,
                     );
 
-                    let streams = vec![depth_stream(&derived_plan)];
+                    let streams = {
+                        let heatmap_cfg = self.settings.visual_config.clone().and_then(|cfg| cfg.heatmap());
+                        let wants_candles = heatmap_cfg.map(|c| c.show_candles).unwrap_or(false);
+                        if wants_candles {
+                            by_basis_default(
+                                derived_plan.basis,
+                                Timeframe::M5,
+                                |tf| {
+                                    let default_tf = data::chart::heatmap::default_candle_timeframe(tf);
+                                    let k_tf = heatmap_cfg
+                                        .and_then(|cfg| cfg.candle_timeframe)
+                                        .unwrap_or(default_tf);
+                                    vec![
+                                        depth_stream(&derived_plan),
+                                        kline_stream(derived_plan.ticker_info, k_tf),
+                                    ]
+                                },
+                                || vec![depth_stream(&derived_plan)],
+                            )
+                        } else {
+                            vec![depth_stream(&derived_plan)]
+                        }
+                    };
 
                     (content, streams)
                 }
@@ -321,6 +846,60 @@ impl State {
         streams
     }
 
+    pub fn update_heatmap_overlay_streams(
+        &mut self,
+        cfg: data::chart::heatmap::Config,
+    ) -> (bool, Option<StreamKind>) {
+        let basis = self.settings.selected_basis;
+        let desired_tf = match (cfg.show_candles, basis) {
+            (true, Some(Basis::Time(tf))) => {
+                let default_tf = data::chart::heatmap::default_candle_timeframe(tf);
+                Some(cfg.candle_timeframe.unwrap_or(default_tf))
+            }
+            _ => None,
+        };
+        let base_ticker = self.stream_pair();
+
+        let mut changed = false;
+        let mut fetch_stream = None;
+
+        if let ResolvedStream::Ready(streams) = &mut self.streams {
+            if let Some(tf) = desired_tf {
+                let mut found = false;
+                for stream in streams.iter_mut() {
+                    if let StreamKind::Kline { timeframe, .. } = stream {
+                        found = true;
+                        if *timeframe != tf {
+                            *timeframe = tf;
+                            changed = true;
+                            fetch_stream = Some(*stream);
+                        }
+                    }
+                }
+
+                if !found {
+                    if let Some(ticker_info) = base_ticker {
+                        let stream = StreamKind::Kline {
+                            ticker_info,
+                            timeframe: tf,
+                        };
+                        streams.push(stream);
+                        changed = true;
+                        fetch_stream = Some(stream);
+                    }
+                }
+            } else {
+                let before = streams.len();
+                streams.retain(|stream| !matches!(stream, StreamKind::Kline { .. }));
+                if streams.len() != before {
+                    changed = true;
+                }
+            }
+        }
+
+        (changed, fetch_stream)
+    }
+
     pub fn insert_hist_oi(&mut self, req_id: Option<uuid::Uuid>, oi: &[OpenInterest]) {
         match &mut self.content {
             Content::Kline { chart, .. } => {
@@ -343,6 +922,12 @@ impl State {
         klines: &[Kline],
     ) {
         match &mut self.content {
+            Content::Heatmap { chart: Some(c), .. } => {
+                // Candles overlay on heatmap: accept fetched kline history too (not just realtime).
+                if c.visual_config().show_candles {
+                    c.on_insert_klines(klines);
+                }
+            }
             Content::Kline {
                 chart, indicators, ..
             } => {
@@ -364,7 +949,7 @@ impl State {
                     let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
                     let layout = chart.chart_layout();
 
-                    *chart = KlineChart::new(
+                    let mut new_chart = KlineChart::new(
                         layout,
                         Basis::Time(timeframe),
                         tick_size,
@@ -374,6 +959,16 @@ impl State {
                         ticker_info,
                         chart.kind(),
                     );
+
+                    let visual_cfg = self
+                        .settings
+                        .visual_config
+                        .clone()
+                        .and_then(|cfg| cfg.kline())
+                        .unwrap_or_default();
+                    new_chart.set_visual_config(visual_cfg);
+
+                    *chart = new_chart;
                 }
             }
             Content::Comparison(chart) => {
@@ -696,18 +1291,21 @@ impl State {
                     let kind = ModifierKind::Heatmap(basis, tick_multiply);
                     let base_ticksize = tick_multiply.base(chart.tick_size());
 
-                    let modifiers = row![
-                        basis_modifier(id, basis, modifier, kind),
-                        ticksize_modifier(
+                    let modifiers = {
+                        let mut r = row![basis_modifier(id, basis, modifier, kind)];
+                        if chart.visual_config().show_candles {
+                            r = r.push(go_to_latest_button(id));
+                        }
+                        r = r.push(ticksize_modifier(
                             id,
                             base_ticksize,
                             tick_multiply,
                             modifier,
                             kind,
-                            exchange
-                        ),
-                    ]
-                    .spacing(4);
+                            exchange,
+                        ));
+                        r.spacing(4)
+                    };
 
                     stream_info_element = stream_info_element.push(modifiers);
 
@@ -724,21 +1322,10 @@ impl State {
                         )
                     };
 
-                    let indicator_modal = if self.modal == Some(Modal::Indicators) {
-                        Some(modal::indicators::view(
-                            id,
-                            self,
-                            indicators,
-                            self.stream_pair().map(|i| i.ticker.market_type()),
-                        ))
-                    } else {
-                        None
-                    };
-
                     self.compose_stack_view(
                         base,
                         id,
-                        indicator_modal,
+                        None,
                         compact_controls,
                         settings_modal,
                         None,
@@ -800,7 +1387,26 @@ impl State {
                             let kind = ModifierKind::Candlestick(selected_basis);
 
                             let modifiers =
-                                row![basis_modifier(id, selected_basis, modifier, kind),]
+                                row![
+                                    basis_modifier(id, selected_basis, modifier, kind),
+                                    go_to_latest_button(id),
+                                ]
+                                    .spacing(4);
+
+                            stream_info_element = stream_info_element.push(modifiers);
+                        }
+                        data::chart::KlineChartKind::CandlesStudied { .. } => {
+                            let selected_basis = self
+                                .settings
+                                .selected_basis
+                                .unwrap_or(Timeframe::M15.into());
+                            let kind = ModifierKind::Candlestick(selected_basis);
+
+                            let modifiers =
+                                row![
+                                    basis_modifier(id, selected_basis, modifier, kind),
+                                    go_to_latest_button(id),
+                                ]
                                     .spacing(4);
 
                             stream_info_element = stream_info_element.push(modifiers);
@@ -813,28 +1419,19 @@ impl State {
                     let settings_modal = || {
                         kline_cfg_view(
                             chart.study_configurator(),
-                            data::chart::kline::Config {},
+                            chart.candle_study_configurator(),
+                            chart.visual_config(),
                             chart_kind,
                             id,
                             chart.basis(),
+                            &self.settings_colors_expanded,
                         )
-                    };
-
-                    let indicator_modal = if self.modal == Some(Modal::Indicators) {
-                        Some(modal::indicators::view(
-                            id,
-                            self,
-                            indicators,
-                            self.stream_pair().map(|i| i.ticker.market_type()),
-                        ))
-                    } else {
-                        None
                     };
 
                     self.compose_stack_view(
                         base,
                         id,
-                        indicator_modal,
+                        None,
                         compact_controls,
                         settings_modal,
                         None,
@@ -843,6 +1440,9 @@ impl State {
                 } else {
                     let content_kind = match chart_kind {
                         data::chart::KlineChartKind::Candles => ContentKind::CandlestickChart,
+                        data::chart::KlineChartKind::CandlesStudied { .. } => {
+                            ContentKind::CandlestickChart
+                        }
                         data::chart::KlineChartKind::Footprint { .. } => {
                             ContentKind::FootprintChart
                         }
@@ -936,6 +1536,21 @@ impl State {
             Event::ContentSelected(kind) => {
                 self.content = Content::placeholder(kind);
 
+                // Candles+Heatmap is a Heatmap pane with candle overlay enabled by default.
+                if matches!(kind, ContentKind::CandlesHeatmapChart) {
+                    let cfg = self
+                        .settings
+                        .visual_config
+                        .clone()
+                        .and_then(|vc| vc.heatmap())
+                        .unwrap_or_default();
+                    let cfg = data::chart::heatmap::Config {
+                        show_candles: true,
+                        ..cfg
+                    };
+                    self.settings.visual_config = Some(VisualConfig::Heatmap(cfg));
+                }
+
                 if !matches!(kind, ContentKind::Starter) {
                     self.streams = ResolvedStream::Waiting(vec![]);
                     let modal = Modal::MiniTickersList(MiniPanel::new());
@@ -947,13 +1562,47 @@ impl State {
             }
             Event::ChartInteraction(msg) => match &mut self.content {
                 Content::Heatmap { chart: Some(c), .. } => {
+                    if let crate::chart::Message::ContextMenuRequested(_pos) = msg {
+                        // no context menu for heatmap panes (yet)
+                        return None;
+                    }
                     super::chart::update(c, &msg);
                 }
-                Content::Kline { chart: Some(c), .. } => {
+                Content::Kline { chart: Some(c), kind, .. } => {
+                    if let crate::chart::Message::ContextMenuRequested(pos) = msg {
+                        // only for Candlestick panes (candles/candles+studies)
+                        if matches!(
+                            kind,
+                            data::chart::KlineChartKind::Candles
+                                | data::chart::KlineChartKind::CandlesStudied { .. }
+                        ) {
+                            let pos = iced::Point::new(pos.x.max(0.0), pos.y.max(0.0));
+                            let _ = self.show_modal_with_focus(Modal::ContextMenu(pos));
+                        }
+                        return None;
+                    }
                     super::chart::update(c, &msg);
                 }
                 _ => {}
             },
+            Event::GoToLatest => {
+                match &mut self.content {
+                    Content::Kline { chart: Some(c), .. } => {
+                        super::chart::update(c, &crate::chart::Message::DoubleClick(crate::chart::AxisScaleClicked::X));
+                    }
+                    _ => {}
+                }
+            },
+            Event::ResizeCenteredModal(kind, w, h) => {
+                // Keep sizes sane
+                let w = w.clamp(280.0, 1200.0);
+                let h = h.clamp(220.0, 1000.0);
+                match kind {
+                    CenteredModalKind::Rules => self.centered_rules_size = (w, h),
+                    CenteredModalKind::Indicators => self.centered_indicators_size = (w, h),
+                    CenteredModalKind::RuleLog => self.centered_rule_log_size = (w, h),
+                }
+            }
             Event::PanelInteraction(msg) => match &mut self.content {
                 Content::Ladder(Some(p)) => super::panel::update(p, msg),
                 Content::TimeAndSales(Some(p)) => super::panel::update(p, msg),
@@ -961,6 +1610,237 @@ impl State {
             },
             Event::ToggleIndicator(ind) => {
                 self.content.toggle_indicator(ind);
+            }
+            Event::AddRule => {
+                self.rules.push(RuleSpec::default());
+            }
+            Event::AddRuleAndOpen => {
+                let rule = RuleSpec::default();
+                let id = rule.id;
+                self.rules.push(rule);
+                self.rules_expanded = Some(id);
+                let _ = self.show_modal_with_focus(Modal::Rules);
+            }
+            Event::DeleteRule(id) => {
+                self.rules.retain(|r| r.id != id);
+                if self.rules_expanded == Some(id) {
+                    self.rules_expanded = None;
+                }
+            }
+            Event::ToggleRule(id, enabled) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    rule.enabled = enabled;
+                }
+            }
+            Event::ToggleRuleCard(id) => {
+                self.rules_expanded = if self.rules_expanded == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
+            }
+            Event::UpdateRuleName(id, name) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    rule.name = name;
+                }
+            }
+            Event::UpdateRuleEvaluation(id, mode) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    rule.evaluation = mode;
+                }
+            }
+            Event::UpdateRuleConditionKind(id, kind) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    rule.condition = match kind {
+                        modal::pane::rules::ConditionKind::PriceCrossLevel => {
+                            RuleCondition::PriceCrossLevel {
+                                level: 0.0,
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::CandleCloseCrossLevel => {
+                            RuleCondition::CandleCloseCrossLevel {
+                                level: 0.0,
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::VolumeIs => RuleCondition::VolumeIs {
+                            value: 0.0,
+                            direction: data::rules::CompareDirection::Above,
+                        },
+                        modal::pane::rules::ConditionKind::MovingAverageCross => {
+                            RuleCondition::MovingAverageCross {
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::RsiCrossLevel => {
+                            RuleCondition::RsiCrossLevel {
+                                level: 50.0,
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::MacdCrossSignal => {
+                            RuleCondition::MacdCrossSignal {
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::VwapCross => RuleCondition::VwapCross {
+                            direction: data::rules::CrossDirection::CrossUp,
+                        },
+                        modal::pane::rules::ConditionKind::SupertrendFlip => {
+                            RuleCondition::SupertrendFlip {
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::SupertrendLineCross => {
+                            RuleCondition::SupertrendLineCross {
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::DonchianBreakout => {
+                            RuleCondition::DonchianBreakout {
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::KeltnerBreakout => {
+                            RuleCondition::KeltnerBreakout {
+                                direction: data::rules::CrossDirection::CrossUp,
+                            }
+                        }
+                        modal::pane::rules::ConditionKind::DmiCross => RuleCondition::DmiCross {
+                            direction: data::rules::CrossDirection::CrossUp,
+                        },
+                        modal::pane::rules::ConditionKind::AdxIs => RuleCondition::AdxIs {
+                            value: 20.0,
+                            direction: data::rules::CompareDirection::Above,
+                        },
+                    };
+                }
+            }
+            Event::UpdateRuleCrossDirection(id, dir) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    match &mut rule.condition {
+                        RuleCondition::PriceCrossLevel { direction, .. }
+                        | RuleCondition::CandleCloseCrossLevel { direction, .. }
+                        | RuleCondition::MovingAverageCross { direction }
+                        | RuleCondition::RsiCrossLevel { direction, .. }
+                        | RuleCondition::MacdCrossSignal { direction }
+                        | RuleCondition::VwapCross { direction }
+                        | RuleCondition::SupertrendFlip { direction }
+                        | RuleCondition::SupertrendLineCross { direction }
+                        | RuleCondition::DonchianBreakout { direction }
+                        | RuleCondition::KeltnerBreakout { direction }
+                        | RuleCondition::DmiCross { direction } => {
+                            *direction = dir;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::UpdateRuleCompareDirection(id, dir) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    match &mut rule.condition {
+                        RuleCondition::VolumeIs { direction, .. }
+                        | RuleCondition::AdxIs { direction, .. } => {
+                            *direction = dir;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::UpdateRuleLevel(id, raw) => {
+                let Ok(v) = raw.trim().parse::<f32>() else { return None; };
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    match &mut rule.condition {
+                        RuleCondition::PriceCrossLevel { level, .. }
+                        | RuleCondition::CandleCloseCrossLevel { level, .. }
+                        | RuleCondition::RsiCrossLevel { level, .. } => {
+                            *level = v;
+                        }
+                        RuleCondition::VolumeIs { value, .. } => {
+                            *value = v;
+                        }
+                        RuleCondition::AdxIs { value, .. } => {
+                            *value = v;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::ToggleRuleActionToast(id, enabled) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    State::upsert_action(
+                        rule,
+                        RuleAction::Toast {
+                            message: "Rule triggered".to_string(),
+                        },
+                        enabled,
+                    );
+                }
+            }
+            Event::UpdateRuleToastMessage(id, msg) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    State::set_toast_message(rule, msg);
+                }
+            }
+            Event::ToggleRuleActionSound(id, enabled) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    State::upsert_action(rule, RuleAction::Sound { enabled: true }, enabled);
+                }
+            }
+            Event::ToggleRuleActionTelegram(id, enabled) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    State::upsert_action(rule, RuleAction::Telegram { enabled: true }, enabled);
+                }
+            }
+            Event::ToggleRuleActionPush(id, enabled) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    State::upsert_action(rule, RuleAction::Push { enabled: true }, enabled);
+                }
+            }
+            Event::ToggleSettingsColors(section) => {
+                if self.settings_colors_expanded.contains(&section) {
+                    self.settings_colors_expanded.remove(&section);
+                } else {
+                    self.settings_colors_expanded.insert(section);
+                }
+            }
+            Event::IndicatorsQueryChanged(q) => {
+                self.indicators_query = q;
+            }
+            Event::IndicatorsSidebarSelected(sidebar) => {
+                self.indicators_sidebar = sidebar;
+            }
+            Event::IndicatorsSourceSelected(source) => {
+                self.indicators_source = source;
+                // reset filters when switching source
+                self.indicators_query.clear();
+                self.indicators_sidebar = IndicatorsSidebar::All;
+            }
+            Event::ToggleRuleActionPaperTrade(id, enabled) => {
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    State::upsert_action(
+                        rule,
+                        RuleAction::PaperTrade {
+                            side: data::rules::Side::Buy,
+                            percent_of_balance: 25.0,
+                        },
+                        enabled,
+                    );
+                }
+            }
+            Event::UpdateRulePaperPercent(id, raw) => {
+                let Ok(v) = raw.trim().parse::<f32>() else { return None; };
+                if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
+                    for a in &mut rule.actions {
+                        if let RuleAction::PaperTrade { percent_of_balance, .. } = a {
+                            *percent_of_balance = v;
+                        }
+                    }
+                }
+            }
+            Event::ClearRuleLog => {
+                self.rule_log.clear();
             }
             Event::DeleteNotification(idx) => {
                 if idx < self.notifications.len() {
@@ -1003,6 +1883,14 @@ impl State {
                     {
                         c.update_study_configurator(m);
                         *studies = c.studies.clone();
+                    }
+                }
+                modal::pane::settings::study::StudyMessage::Candle(m) => {
+                    if let Content::Kline { chart, kind, .. } = &mut self.content
+                        && let Some(c) = chart
+                    {
+                        c.update_candle_study_configurator(m);
+                        *kind = c.kind.clone();
                     }
                 }
             },
@@ -1311,6 +2199,24 @@ impl State {
             ));
         }
 
+        if !treat_as_starter && matches!(&self.content, Content::Kline { .. }) {
+            buttons = buttons.push(button_with_tooltip(
+                icon_text(Icon::Edit, 12),
+                show_modal(Modal::Rules),
+                Some("Rules"),
+                tooltip_pos,
+                modal_btn_style(Modal::Rules),
+            ));
+
+            buttons = buttons.push(button_with_tooltip(
+                icon_text(Icon::Search, 12),
+                show_modal(Modal::RuleLog),
+                Some("Rule log"),
+                tooltip_pos,
+                modal_btn_style(Modal::RuleLog),
+            ));
+        }
+
         if is_popout {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Popout, 12),
@@ -1364,7 +2270,7 @@ impl State {
         &'a self,
         base: Element<'a, Message>,
         pane: pane_grid::Pane,
-        indicator_modal: Option<Element<'a, Message>>,
+        _indicator_modal: Option<Element<'a, Message>>,
         compact_controls: Option<Element<'a, Message>>,
         settings_modal: F,
         selected_tickers: Option<&'a [TickerInfo]>,
@@ -1391,6 +2297,7 @@ impl State {
                     on_blur,
                     padding::right(12).left(4),
                     Alignment::Start,
+                    Alignment::Start,
                 )
             }
             Some(Modal::StreamModifier(modifier)) => stack_modal(
@@ -1400,6 +2307,7 @@ impl State {
                 }),
                 Message::PaneEvent(pane, Event::HideModal),
                 padding::right(12).left(48),
+                Alignment::Start,
                 Alignment::Start,
             ),
             Some(Modal::MiniTickersList(panel)) => {
@@ -1421,6 +2329,7 @@ impl State {
                     Message::PaneEvent(pane, Event::HideModal),
                     padding::left(12),
                     Alignment::Start,
+                    Alignment::Start,
                 )
             }
             Some(Modal::Settings) => stack_modal(
@@ -1429,14 +2338,11 @@ impl State {
                 on_blur,
                 padding::right(12).left(12),
                 Alignment::End,
+                Alignment::Center,
             ),
-            Some(Modal::Indicators) => stack_modal(
-                base,
-                indicator_modal.unwrap_or_else(|| column![].into()),
-                on_blur,
-                padding::right(12).left(12),
-                Alignment::End,
-            ),
+            // NOTE: Indicators/Rules/RuleLog are rendered as window-level (global) modals in `dashboard::view`
+            // so they are not constrained by the pane size.
+            Some(Modal::Indicators) | Some(Modal::Rules) | Some(Modal::RuleLog) => base,
             Some(Modal::Controls) => stack_modal(
                 base,
                 if let Some(controls) = compact_controls {
@@ -1447,7 +2353,24 @@ impl State {
                 on_blur,
                 padding::left(12),
                 Alignment::End,
+                Alignment::Center,
             ),
+            Some(Modal::ContextMenu(pos)) => {
+                let menu: Element<_> = container(
+                    column![
+                        button("Rules…").on_press(Message::PaneEvent(pane, Event::ShowModal(Modal::Rules))),
+                        button("Indicators…")
+                            .on_press(Message::PaneEvent(pane, Event::ShowModal(Modal::Indicators))),
+                        button("Add rule…").on_press(Message::PaneEvent(pane, Event::AddRuleAndOpen)),
+                    ]
+                    .spacing(6),
+                )
+                .padding(10)
+                .style(style::chart_modal)
+                .into();
+
+                stack_context_menu(base, menu, on_blur, *pos)
+            }
             None => base,
         }
     }
@@ -1556,6 +2479,545 @@ impl State {
     pub fn unique_id(&self) -> uuid::Uuid {
         self.id
     }
+
+    // === Indicator math helpers (MVP) ===
+}
+
+#[derive(Clone, Copy)]
+struct MaCfg {
+    kind: data::chart::kline::MovingAverageKind,
+    period: u16,
+}
+
+fn ma_pair_from_kind(kind: &data::chart::KlineChartKind) -> Option<(MaCfg, MaCfg)> {
+    let data::chart::KlineChartKind::CandlesStudied { studies } = kind else {
+        return None;
+    };
+
+    let mut fast: Option<MaCfg> = None;
+    let mut slow: Option<MaCfg> = None;
+    for s in studies {
+        match *s {
+            data::chart::kline::CandleStudy::MovingAverageFast { kind, period, .. } => {
+                fast = Some(MaCfg { kind, period });
+            }
+            data::chart::kline::CandleStudy::MovingAverageSlow { kind, period, .. } => {
+                slow = Some(MaCfg { kind, period });
+            }
+            _ => {}
+        }
+    }
+    Some((fast?, slow?))
+}
+
+#[derive(Clone, Copy)]
+struct VwapCfg {
+    reset_daily_utc: bool,
+}
+
+fn vwap_cfg_from_kind(kind: &data::chart::KlineChartKind) -> Option<VwapCfg> {
+    let data::chart::KlineChartKind::CandlesStudied { studies } = kind else {
+        return None;
+    };
+    for s in studies {
+        if let data::chart::kline::CandleStudy::VwapBands { reset_daily_utc, .. } = *s {
+            return Some(VwapCfg { reset_daily_utc });
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct SupertrendCfg {
+    atr_period: u16,
+    multiplier_x100: u16,
+}
+
+fn supertrend_cfg_from_kind(kind: &data::chart::KlineChartKind) -> Option<SupertrendCfg> {
+    let data::chart::KlineChartKind::CandlesStudied { studies } = kind else {
+        return None;
+    };
+    for s in studies {
+        if let data::chart::kline::CandleStudy::Supertrend {
+            atr_period,
+            multiplier_x100,
+            ..
+        } = *s
+        {
+            return Some(SupertrendCfg {
+                atr_period,
+                multiplier_x100,
+            });
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct DonchianCfg {
+    period: u16,
+}
+
+fn donchian_cfg_from_kind(kind: &data::chart::KlineChartKind) -> Option<DonchianCfg> {
+    let data::chart::KlineChartKind::CandlesStudied { studies } = kind else {
+        return None;
+    };
+    for s in studies {
+        if let data::chart::kline::CandleStudy::DonchianChannels { period, .. } = *s {
+            return Some(DonchianCfg { period });
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct KeltnerCfg {
+    ema_period: u16,
+    atr_period: u16,
+    multiplier_x100: u16,
+}
+
+fn keltner_cfg_from_kind(kind: &data::chart::KlineChartKind) -> Option<KeltnerCfg> {
+    let data::chart::KlineChartKind::CandlesStudied { studies } = kind else {
+        return None;
+    };
+    for s in studies {
+        if let data::chart::kline::CandleStudy::KeltnerChannels {
+            ema_period,
+            atr_period,
+            multiplier_x100,
+            ..
+        } = *s
+        {
+            return Some(KeltnerCfg {
+                ema_period,
+                atr_period,
+                multiplier_x100,
+            });
+        }
+    }
+    None
+}
+
+fn ma_last_two(
+    closes: &[f32],
+    kind: data::chart::kline::MovingAverageKind,
+    period: u16,
+) -> Option<(f32, f32)> {
+    let p = (period as usize).max(2);
+    if closes.len() < p + 1 {
+        return None;
+    }
+    match kind {
+        data::chart::kline::MovingAverageKind::SMA => {
+            let cur = closes[closes.len() - p..].iter().sum::<f32>() / p as f32;
+            let prev = closes[closes.len() - p - 1..closes.len() - 1]
+                .iter()
+                .sum::<f32>()
+                / p as f32;
+            Some((prev, cur))
+        }
+        data::chart::kline::MovingAverageKind::EMA => {
+            let k = 2.0 / (p as f32 + 1.0);
+            let start = closes.len().saturating_sub(p + 2);
+            let slice = &closes[start..];
+            let mut prev = slice[0];
+            let mut out = Vec::with_capacity(slice.len());
+            out.push(prev);
+            for &v in slice.iter().skip(1) {
+                prev = v * k + prev * (1.0 - k);
+                out.push(prev);
+            }
+            if out.len() >= 2 {
+                Some((out[out.len() - 2], out[out.len() - 1]))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn rsi_last_two(closes: &[f32], period: u16) -> Option<(f32, f32)> {
+    let p = (period as usize).max(2);
+    if closes.len() < p + 2 {
+        return None;
+    }
+    let start = closes.len().saturating_sub(p + 2);
+    let slice = &closes[start..];
+
+    // initial avg gains/losses over first p diffs
+    let mut gains = 0.0f32;
+    let mut losses = 0.0f32;
+    for i in 1..=p {
+        let diff = slice[i] - slice[i - 1];
+        if diff >= 0.0 {
+            gains += diff;
+        } else {
+            losses += -diff;
+        }
+    }
+    let mut avg_gain = gains / p as f32;
+    let mut avg_loss = losses / p as f32;
+
+    let rsi = |ag: f32, al: f32| -> f32 {
+        if al == 0.0 {
+            100.0
+        } else {
+            let rs = ag / al;
+            100.0 - (100.0 / (1.0 + rs))
+        }
+    };
+
+    // rsi at index p
+    let mut prev_rsi = rsi(avg_gain, avg_loss);
+    let mut cur_rsi = prev_rsi;
+
+    // process remaining diffs (we only need last 2 rsi values)
+    for i in (p + 1)..slice.len() {
+        let diff = slice[i] - slice[i - 1];
+        let gain = if diff > 0.0 { diff } else { 0.0 };
+        let loss = if diff < 0.0 { -diff } else { 0.0 };
+        avg_gain = (avg_gain * (p as f32 - 1.0) + gain) / p as f32;
+        avg_loss = (avg_loss * (p as f32 - 1.0) + loss) / p as f32;
+        prev_rsi = cur_rsi;
+        cur_rsi = rsi(avg_gain, avg_loss);
+    }
+
+    Some((prev_rsi, cur_rsi))
+}
+
+fn ema(values: &[f32], period: usize) -> Vec<f32> {
+    if values.is_empty() {
+        return vec![];
+    }
+    let k = 2.0 / (period as f32 + 1.0);
+    let mut out = Vec::with_capacity(values.len());
+    let mut prev = values[0];
+    out.push(prev);
+    for &v in values.iter().skip(1) {
+        prev = v * k + prev * (1.0 - k);
+        out.push(prev);
+    }
+    out
+}
+
+fn macd_last_two(
+    closes: &[f32],
+    fast: u16,
+    slow: u16,
+    signal: u16,
+) -> Option<((f32, f32), (f32, f32))> {
+    let fast = (fast as usize).max(2);
+    let slow = (slow as usize).max(3);
+    let signal = (signal as usize).max(2);
+    if closes.len() < slow + signal + 2 {
+        // not enough for stable MACD; still allow best-effort with what we have
+        if closes.len() < 3 {
+            return None;
+        }
+    }
+    let start = closes.len().saturating_sub(slow + signal + 10);
+    let slice = &closes[start..];
+
+    let ema_fast = ema(slice, fast);
+    let ema_slow = ema(slice, slow);
+    let mut macd_line = Vec::with_capacity(slice.len());
+    for i in 0..slice.len() {
+        macd_line.push(ema_fast[i] - ema_slow[i]);
+    }
+    let signal_line = ema(&macd_line, signal);
+
+    if macd_line.len() >= 2 && signal_line.len() >= 2 {
+        let pm = macd_line[macd_line.len() - 2];
+        let cm = macd_line[macd_line.len() - 1];
+        let ps = signal_line[signal_line.len() - 2];
+        let cs = signal_line[signal_line.len() - 1];
+        Some(((pm, ps), (cm, cs)))
+    } else {
+        None
+    }
+}
+
+fn vwap_last_two(ohlcv: &[(u64, f32, f32, f32, f32)], reset_daily_utc: bool) -> Option<(f32, f32)> {
+    if ohlcv.len() < 2 {
+        return None;
+    }
+
+    let start_idx = if reset_daily_utc {
+        let day_ms = 86_400_000u64;
+        let last_day = ohlcv[ohlcv.len() - 1].0 / day_ms;
+        ohlcv
+            .iter()
+            .rposition(|(t, _, _, _, _)| (*t / day_ms) != last_day)
+            .map(|idx| idx + 1)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut sum_w = 0.0f32;
+    let mut sum_wx = 0.0f32;
+    let mut out = Vec::with_capacity(ohlcv.len() - start_idx);
+    for &(_, _, _, close, vol) in &ohlcv[start_idx..] {
+        if vol > 0.0 {
+            sum_w += vol;
+            sum_wx += close * vol;
+        }
+        if sum_w > 0.0 {
+            out.push(sum_wx / sum_w);
+        } else {
+            out.push(close);
+        }
+    }
+
+    if out.len() >= 2 {
+        Some((out[out.len() - 2], out[out.len() - 1]))
+    } else {
+        None
+    }
+}
+
+fn donchian_last_two(
+    ohlcv: &[(u64, f32, f32, f32, f32)],
+    period: u16,
+) -> Option<((f32, f32), (f32, f32))> {
+    let p = (period as usize).max(2);
+    if ohlcv.len() < p + 1 {
+        return None;
+    }
+
+    let channel_at = |end_idx: usize| -> (f32, f32) {
+        let start = end_idx + 1 - p;
+        let mut upper = f32::NEG_INFINITY;
+        let mut lower = f32::INFINITY;
+        for &(_, high, low, _, _) in &ohlcv[start..=end_idx] {
+            if high > upper {
+                upper = high;
+            }
+            if low < lower {
+                lower = low;
+            }
+        }
+        (upper, lower)
+    };
+
+    let prev_end = ohlcv.len() - 2;
+    let cur_end = ohlcv.len() - 1;
+    Some((channel_at(prev_end), channel_at(cur_end)))
+}
+
+fn atr_series_wilder(ohlcv: &[(u64, f32, f32, f32, f32)], period: usize) -> Option<Vec<f32>> {
+    if ohlcv.len() < period + 1 {
+        return None;
+    }
+    let mut tr = Vec::with_capacity(ohlcv.len());
+    tr.push((ohlcv[0].1 - ohlcv[0].2).abs());
+    for i in 1..ohlcv.len() {
+        let (_, high, low, _close, _) = ohlcv[i];
+        let prev_close = ohlcv[i - 1].3;
+        let a = (high - low).abs();
+        let b = (high - prev_close).abs();
+        let c = (low - prev_close).abs();
+        tr.push(a.max(b).max(c));
+    }
+
+    let mut atr = vec![0.0f32; ohlcv.len()];
+    let mut sum = 0.0f32;
+    for i in 1..=period {
+        sum += tr[i];
+    }
+    let mut prev = sum / period as f32;
+    atr[period] = prev;
+    for i in (period + 1)..ohlcv.len() {
+        prev = (prev * (period as f32 - 1.0) + tr[i]) / period as f32;
+        atr[i] = prev;
+    }
+    // fill leading values with the first computed ATR so consumers can still index safely
+    for i in 0..period {
+        atr[i] = atr[period];
+    }
+    Some(atr)
+}
+
+fn keltner_last_two(
+    ohlcv: &[(u64, f32, f32, f32, f32)],
+    ema_period: u16,
+    atr_period: u16,
+    multiplier_x100: u16,
+) -> Option<((f32, f32), (f32, f32))> {
+    if ohlcv.len() < 3 {
+        return None;
+    }
+    let ema_period = (ema_period as usize).max(2);
+    let atr_period = (atr_period as usize).max(2);
+    let mult = multiplier_x100 as f32 / 100.0;
+
+    let closes: Vec<f32> = ohlcv.iter().map(|&(_, _, _, c, _)| c).collect();
+    let mid = ema(&closes, ema_period);
+    let atr = atr_series_wilder(ohlcv, atr_period)?;
+
+    let prev = ohlcv.len() - 2;
+    let cur = ohlcv.len() - 1;
+    let p_upper = mid[prev] + atr[prev] * mult;
+    let p_lower = mid[prev] - atr[prev] * mult;
+    let c_upper = mid[cur] + atr[cur] * mult;
+    let c_lower = mid[cur] - atr[cur] * mult;
+    Some(((p_upper, p_lower), (c_upper, c_lower)))
+}
+
+fn supertrend_last_two(
+    ohlcv: &[(u64, f32, f32, f32, f32)],
+    atr_period: u16,
+    multiplier_x100: u16,
+) -> Option<((bool, f32), (bool, f32))> {
+    let atr_period = (atr_period as usize).max(2);
+    let mult = multiplier_x100 as f32 / 100.0;
+    let atr = atr_series_wilder(ohlcv, atr_period)?;
+    if ohlcv.len() < atr_period + 2 {
+        return None;
+    }
+
+    let mut final_upper = 0.0f32;
+    let mut final_lower = 0.0f32;
+    let mut trend_up = true;
+
+    let mut prev_pair: Option<(bool, f32)> = None;
+    let mut cur_pair: Option<(bool, f32)> = None;
+
+    for i in 1..ohlcv.len() {
+        let (_, high, low, close, _) = ohlcv[i];
+        let prev_close = ohlcv[i - 1].3;
+        let hl2 = (high + low) * 0.5;
+        let basic_upper = hl2 + mult * atr[i];
+        let basic_lower = hl2 - mult * atr[i];
+
+        if i == 1 {
+            final_upper = basic_upper;
+            final_lower = basic_lower;
+        } else {
+            // final upper
+            if basic_upper < final_upper || prev_close > final_upper {
+                final_upper = basic_upper;
+            }
+            // final lower
+            if basic_lower > final_lower || prev_close < final_lower {
+                final_lower = basic_lower;
+            }
+        }
+
+        // trend
+        if trend_up {
+            if close < final_lower {
+                trend_up = false;
+            }
+        } else if close > final_upper {
+            trend_up = true;
+        }
+
+        let supertrend = if trend_up { final_lower } else { final_upper };
+
+        if i == ohlcv.len() - 2 {
+            prev_pair = Some((trend_up, supertrend));
+        }
+        if i == ohlcv.len() - 1 {
+            cur_pair = Some((trend_up, supertrend));
+        }
+    }
+
+    Some((prev_pair?, cur_pair?))
+}
+
+fn dmi_adx_last_two(
+    ohlcv: &[(u64, f32, f32, f32, f32)],
+    period: u16,
+) -> Option<((f32, f32, f32), (f32, f32, f32))> {
+    let p = (period as usize).max(2);
+    if ohlcv.len() < (2 * p + 3) {
+        return None;
+    }
+
+    let mut tr = Vec::with_capacity(ohlcv.len());
+    let mut plus_dm = Vec::with_capacity(ohlcv.len());
+    let mut minus_dm = Vec::with_capacity(ohlcv.len());
+    tr.push((ohlcv[0].1 - ohlcv[0].2).abs());
+    plus_dm.push(0.0);
+    minus_dm.push(0.0);
+
+    for i in 1..ohlcv.len() {
+        let (_, high, low, _close, _) = ohlcv[i];
+        let (_, prev_high, prev_low, prev_close, _) = ohlcv[i - 1];
+
+        let up_move = high - prev_high;
+        let down_move = prev_low - low;
+        let pdm = if up_move > down_move && up_move > 0.0 { up_move } else { 0.0 };
+        let mdm = if down_move > up_move && down_move > 0.0 { down_move } else { 0.0 };
+
+        let a = (high - low).abs();
+        let b = (high - prev_close).abs();
+        let c = (low - prev_close).abs();
+        let t = a.max(b).max(c);
+
+        tr.push(t);
+        plus_dm.push(pdm);
+        minus_dm.push(mdm);
+    }
+
+    // Wilder smoothing for TR/+DM/-DM
+    let mut sm_tr = tr[1..=p].iter().sum::<f32>();
+    let mut sm_pdm = plus_dm[1..=p].iter().sum::<f32>();
+    let mut sm_mdm = minus_dm[1..=p].iter().sum::<f32>();
+
+    let mut di_plus = vec![0.0f32; ohlcv.len()];
+    let mut di_minus = vec![0.0f32; ohlcv.len()];
+    let mut dx = vec![0.0f32; ohlcv.len()];
+
+    for i in p..ohlcv.len() {
+        if i > p {
+            sm_tr = sm_tr - (sm_tr / p as f32) + tr[i];
+            sm_pdm = sm_pdm - (sm_pdm / p as f32) + plus_dm[i];
+            sm_mdm = sm_mdm - (sm_mdm / p as f32) + minus_dm[i];
+        }
+
+        let pdi = if sm_tr == 0.0 { 0.0 } else { 100.0 * (sm_pdm / sm_tr) };
+        let mdi = if sm_tr == 0.0 { 0.0 } else { 100.0 * (sm_mdm / sm_tr) };
+        di_plus[i] = pdi;
+        di_minus[i] = mdi;
+
+        let denom = pdi + mdi;
+        dx[i] = if denom == 0.0 {
+            0.0
+        } else {
+            100.0 * (pdi - mdi).abs() / denom
+        };
+    }
+
+    // ADX as Wilder smoothing of DX, starting with average of first p DX values after DI starts
+    let adx_start = p * 2;
+    if adx_start + 1 >= ohlcv.len() {
+        return None;
+    }
+    let mut adx = vec![0.0f32; ohlcv.len()];
+    let mut sum_dx = 0.0f32;
+    for i in (p + 1)..=adx_start {
+        sum_dx += dx[i];
+    }
+    let mut prev_adx = sum_dx / p as f32;
+    adx[adx_start] = prev_adx;
+    for i in (adx_start + 1)..ohlcv.len() {
+        prev_adx = (prev_adx * (p as f32 - 1.0) + dx[i]) / p as f32;
+        adx[i] = prev_adx;
+    }
+    // fill leading
+    for i in 0..adx_start {
+        adx[i] = adx[adx_start];
+    }
+
+    let prev = ohlcv.len() - 2;
+    let cur = ohlcv.len() - 1;
+    Some((
+        (di_plus[prev], di_minus[prev], adx[prev]),
+        (di_plus[cur], di_minus[cur], adx[cur]),
+    ))
 }
 
 impl Default for State {
@@ -1569,6 +3031,23 @@ impl Default for State {
             notifications: vec![],
             status: Status::Ready,
             link_group: None,
+            rules: vec![],
+            rules_expanded: None,
+            rule_log: vec![],
+            paper: PaperAccount::default(),
+            rule_last_triggered_ms: HashMap::new(),
+            settings_colors_expanded: HashSet::new(),
+            indicators_query: String::new(),
+            indicators_sidebar: IndicatorsSidebar::All,
+            indicators_source: IndicatorsSource::BuiltIn,
+            last_trade_price: None,
+            prev_trade_price: None,
+            pending_candle_close: None,
+            rule_tick_dirty: false,
+            rule_tick_last_eval: Instant::now(),
+            centered_rules_size: (320.0, 560.0),
+            centered_indicators_size: (640.0, 560.0),
+            centered_rule_log_size: (420.0, 560.0),
         }
     }
 }
@@ -1734,7 +3213,7 @@ impl Content {
                 autoscale: Some(data::chart::Autoscale::FitToVisible),
             });
 
-        let chart = KlineChart::new(
+        let mut chart = KlineChart::new(
             layout.clone(),
             basis,
             tick_size,
@@ -1744,6 +3223,13 @@ impl Content {
             ticker_info,
             &determined_chart_kind,
         );
+
+        let visual_cfg = settings
+            .visual_config
+            .clone()
+            .and_then(|cfg| cfg.kline())
+            .unwrap_or_default();
+        chart.set_visual_config(visual_cfg);
 
         Content::Kline {
             chart: Some(chart),
@@ -1779,6 +3265,15 @@ impl Content {
                 },
             },
             ContentKind::HeatmapChart => Content::Heatmap {
+                chart: None,
+                indicators: vec![HeatmapIndicator::Volume],
+                studies: vec![],
+                layout: ViewConfig {
+                    splits: vec![],
+                    autoscale: Some(data::chart::Autoscale::CenterLatest),
+                },
+            },
+            ContentKind::CandlesHeatmapChart => Content::Heatmap {
                 chart: None,
                 indicators: vec![HeatmapIndicator::Volume],
                 studies: vec![],
@@ -1869,6 +3364,9 @@ impl Content {
             (Content::Heatmap { chart: Some(c), .. }, VisualConfig::Heatmap(cfg)) => {
                 c.set_visual_config(cfg);
             }
+            (Content::Kline { chart: Some(c), .. }, VisualConfig::Kline(cfg)) => {
+                c.set_visual_config(cfg);
+            }
             (Content::TimeAndSales(Some(panel)), VisualConfig::TimeAndSales(cfg)) => {
                 panel.config = cfg;
             }
@@ -1933,10 +3431,21 @@ impl Content {
 
     pub fn kind(&self) -> ContentKind {
         match self {
-            Content::Heatmap { .. } => ContentKind::HeatmapChart,
+            Content::Heatmap { chart, .. } => {
+                let show_candles = chart
+                    .as_ref()
+                    .map(|c| c.visual_config().show_candles)
+                    .unwrap_or(false);
+                if show_candles {
+                    ContentKind::CandlesHeatmapChart
+                } else {
+                    ContentKind::HeatmapChart
+                }
+            }
             Content::Kline { kind, .. } => match kind {
                 data::chart::KlineChartKind::Footprint { .. } => ContentKind::FootprintChart,
                 data::chart::KlineChartKind::Candles => ContentKind::CandlestickChart,
+                data::chart::KlineChartKind::CandlesStudied { .. } => ContentKind::CandlestickChart,
             },
             Content::TimeAndSales(_) => ContentKind::TimeAndSales,
             Content::Ladder(_) => ContentKind::Ladder,
@@ -2041,6 +3550,17 @@ fn ticksize_modifier<'a>(
         .style(move |theme, status| style::button::modifier(theme, status, !is_active))
         .on_press(Message::PaneEvent(id, Event::ShowModal(modifier_modal)))
         .into()
+}
+
+fn go_to_latest_button<'a>(id: pane_grid::Pane) -> Element<'a, Message> {
+    tooltip(
+        button(icon_text(Icon::Return, 12))
+            .on_press(Message::PaneEvent(id, Event::GoToLatest))
+            .style(|theme, status| style::button::transparent(theme, status, false)),
+        Some("Go to latest candle"),
+        crate::TooltipPosition::Top,
+    )
+    .into()
 }
 
 fn basis_modifier<'a>(

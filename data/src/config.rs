@@ -5,8 +5,8 @@ pub mod state;
 pub mod theme;
 pub mod timezone;
 
-pub const MIN_SCALE: f32 = 0.8;
-pub const MAX_SCALE: f32 = 1.5;
+pub const MIN_SCALE: f32 = 0.75;
+pub const MAX_SCALE: f32 = 2.5;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub struct ScaleFactor(f32);

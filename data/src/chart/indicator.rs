@@ -14,6 +14,11 @@ pub trait Indicator: PartialEq + Display + 'static {
 pub enum KlineIndicator {
     Volume,
     OpenInterest,
+    Rsi,
+    Macd,
+    Atr,
+    StochRsi,
+    DmiAdx,
 }
 
 impl Indicator for KlineIndicator {
@@ -29,9 +34,24 @@ impl KlineIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [KlineIndicator; 1] = [KlineIndicator::Volume];
+    const FOR_SPOT: [KlineIndicator; 6] = [
+        KlineIndicator::Volume,
+        KlineIndicator::Rsi,
+        KlineIndicator::Macd,
+        KlineIndicator::Atr,
+        KlineIndicator::StochRsi,
+        KlineIndicator::DmiAdx,
+    ];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 2] = [KlineIndicator::Volume, KlineIndicator::OpenInterest];
+    const FOR_PERPS: [KlineIndicator; 7] = [
+        KlineIndicator::Volume,
+        KlineIndicator::OpenInterest,
+        KlineIndicator::Rsi,
+        KlineIndicator::Macd,
+        KlineIndicator::Atr,
+        KlineIndicator::StochRsi,
+        KlineIndicator::DmiAdx,
+    ];
 }
 
 impl Display for KlineIndicator {
@@ -39,6 +59,11 @@ impl Display for KlineIndicator {
         match self {
             KlineIndicator::Volume => write!(f, "Volume"),
             KlineIndicator::OpenInterest => write!(f, "Open Interest"),
+            KlineIndicator::Rsi => write!(f, "RSI"),
+            KlineIndicator::Macd => write!(f, "MACD"),
+            KlineIndicator::Atr => write!(f, "ATR"),
+            KlineIndicator::StochRsi => write!(f, "Stoch RSI"),
+            KlineIndicator::DmiAdx => write!(f, "DMI / ADX"),
         }
     }
 }

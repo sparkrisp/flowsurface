@@ -12,7 +12,7 @@ use data::util::format_with_commas;
 use exchange::{Kline, Timeframe, Trade};
 use exchange::{adapter::Exchange, fetcher::FetchRange};
 
-use iced::widget::{center, row, text};
+use iced::widget::{center, column, row, text};
 use std::{collections::BTreeMap, ops::RangeInclusive};
 
 pub struct OpenInterestIndicator {
@@ -81,7 +81,12 @@ impl OpenInterestIndicator {
             .padding(0.08)
             .with_tooltip(tooltip);
 
-        indicator_row(main_chart, &self.cache, plot, &self.data, visible_range)
+        column![
+            text("Open Interest").size(12),
+            indicator_row(main_chart, &self.cache, plot, &self.data, visible_range)
+        ]
+        .spacing(4)
+        .into()
     }
 
     // helper to compute (earliest, latest) present OI keys

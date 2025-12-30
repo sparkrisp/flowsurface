@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chart::{comparison, heatmap, kline};
 use crate::panel::{ladder, timeandsales};
+use crate::rules::RuleSpec;
 use crate::util::ok_or_default;
 
 use crate::chart::{
@@ -53,6 +54,8 @@ pub enum Pane {
         settings: Settings,
         #[serde(deserialize_with = "ok_or_default", default)]
         indicators: Vec<KlineIndicator>,
+        #[serde(deserialize_with = "ok_or_default", default)]
+        rules: Vec<RuleSpec>,
         #[serde(deserialize_with = "ok_or_default", default)]
         link_group: Option<LinkGroup>,
     },
@@ -186,6 +189,7 @@ impl VisualConfig {
 pub enum ContentKind {
     Starter,
     HeatmapChart,
+    CandlesHeatmapChart,
     FootprintChart,
     CandlestickChart,
     ComparisonChart,
@@ -194,9 +198,10 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 7] = [
+    pub const ALL: [ContentKind; 8] = [
         ContentKind::Starter,
         ContentKind::HeatmapChart,
+        ContentKind::CandlesHeatmapChart,
         ContentKind::FootprintChart,
         ContentKind::CandlestickChart,
         ContentKind::ComparisonChart,
@@ -210,6 +215,7 @@ impl std::fmt::Display for ContentKind {
         let s = match self {
             ContentKind::Starter => "Starter Pane",
             ContentKind::HeatmapChart => "Heatmap Chart",
+            ContentKind::CandlesHeatmapChart => "Candles + Heatmap",
             ContentKind::FootprintChart => "Footprint Chart",
             ContentKind::CandlestickChart => "Candlestick Chart",
             ContentKind::ComparisonChart => "Comparison Chart",
@@ -246,7 +252,7 @@ impl PaneSetup {
             .unwrap_or(is_client_aggr);
 
         let basis = match content_kind {
-            ContentKind::HeatmapChart => {
+            ContentKind::HeatmapChart | ContentKind::CandlesHeatmapChart => {
                 let current = current_basis.and_then(|b| match b {
                     Basis::Time(tf) if exchange.supports_heatmap_timeframe(tf) => Some(b),
                     _ => None,
@@ -266,7 +272,7 @@ impl PaneSetup {
         };
 
         let tick_multiplier = match content_kind {
-            ContentKind::HeatmapChart | ContentKind::Ladder => {
+            ContentKind::HeatmapChart | ContentKind::CandlesHeatmapChart | ContentKind::Ladder => {
                 let tm = if !is_client_aggr && prev_is_client_aggr {
                     TickMultiplier(10)
                 } else if let Some(tm) = current_tick_multiplier {
@@ -295,12 +301,16 @@ impl PaneSetup {
         let depth_aggr = exchange.stream_ticksize(tick_multiplier, TickMultiplier(50));
 
         let push_freq = match content_kind {
-            ContentKind::HeatmapChart if exchange.is_custom_push_freq() => match basis {
+            ContentKind::HeatmapChart | ContentKind::CandlesHeatmapChart
+                if exchange.is_custom_push_freq() =>
+            {
+                match basis {
                 Some(Basis::Time(tf)) if exchange.supports_heatmap_timeframe(tf) => {
                     exchange::PushFrequency::Custom(tf)
                 }
                 _ => exchange::PushFrequency::ServerDefault,
-            },
+                }
+            }
             _ => exchange::PushFrequency::ServerDefault,
         };
 

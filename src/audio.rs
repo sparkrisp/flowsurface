@@ -13,7 +13,7 @@ pub const HARD_SELL_SOUND: &str = "fall-on-foam-splash.wav";
 
 const OVERLAP_THRESHOLD: Duration = Duration::from_millis(10);
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum SoundType {
     Buy = 0,
     HardBuy = 1,

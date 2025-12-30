@@ -99,8 +99,12 @@ impl canvas::Program<Message> for IndicatorLabel<'_> {
 
         let (highest, lowest) = (self.max, self.min);
         let range = highest - lowest;
-
-        let tick_size = data::util::guesstimate_ticks(range);
+        let has_range = range.is_finite() && range.abs() > 1e-6;
+        let tick_size = if has_range {
+            data::util::guesstimate_ticks(range)
+        } else {
+            1.0
+        };
 
         let labels = self.label_cache.draw(renderer, bounds.size(), |frame| {
             let mut all_labels = linear::generate_labels(
@@ -120,6 +124,11 @@ impl canvas::Program<Message> for IndicatorLabel<'_> {
             };
 
             if let Some(crosshair_pos) = cursor.position_in(common_bounds) {
+                if !has_range {
+                    AxisLabel::filter_and_draw(&all_labels, frame);
+                    return;
+                }
+
                 let rounded_value = round_to_tick(
                     lowest + (range * (bounds.height - crosshair_pos.y) / bounds.height),
                     tick_size,
@@ -133,6 +142,10 @@ impl canvas::Program<Message> for IndicatorLabel<'_> {
                 };
 
                 let y_position = bounds.height - ((rounded_value - lowest) / range * bounds.height);
+                if !y_position.is_finite() {
+                    AxisLabel::filter_and_draw(&all_labels, frame);
+                    return;
+                }
 
                 all_labels.push(AxisLabel::Y {
                     bounds: calc_label_rect(y_position, 1, TEXT_SIZE, bounds),

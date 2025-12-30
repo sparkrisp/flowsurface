@@ -7,6 +7,8 @@ mod logger;
 mod modal;
 mod screen;
 mod style;
+mod telegram;
+mod push;
 mod widget;
 mod window;
 
@@ -65,6 +67,7 @@ struct Flowsurface {
     timezone: data::UserTimezone,
     theme: data::Theme,
     notifications: Vec<Toast>,
+    persist_stream_errors_logged: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +87,7 @@ enum Message {
     DataFolderRequested,
     ThemeSelected(data::Theme),
     ScaleFactorChanged(data::ScaleFactor),
+    ZoomFocusedPane { zoom_in: bool },
     SetTimezone(data::UserTimezone),
     ToggleTradeFetch(bool),
     ApplyVolumeSizeUnit(exchange::SizeUnit),
@@ -123,6 +127,7 @@ impl Flowsurface {
             volume_size_unit: saved_state.volume_size_unit,
             theme: saved_state.theme,
             notifications: vec![],
+            persist_stream_errors_logged: std::collections::HashSet::new(),
         };
 
         let active_layout_id = state.layout_manager.active_layout_id().unwrap_or(
@@ -146,6 +151,13 @@ impl Flowsurface {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ZoomFocusedPane { zoom_in } => {
+                // keyboard zoom for currently focused pane (chart panes only)
+                let delta_y = if zoom_in { 4.0 } else { -4.0 };
+                let main_window_id = self.main_window.id;
+                let dashboard = self.active_dashboard_mut();
+                dashboard.zoom_focused_pane(delta_y, main_window_id);
+            },
             Message::MarketWsEvent(event) => {
                 let main_window_id = self.main_window.id;
                 let dashboard = self.active_dashboard_mut();
@@ -285,6 +297,14 @@ impl Flowsurface {
                             self.notifications.push(toast);
                             Task::none()
                         }
+                        Some(dashboard::Event::PlaySound(sound)) => {
+                            if let Err(err) = self.audio_stream.play(sound) {
+                                self.notifications.push(Toast::error(format!(
+                                    "Failed to play sound: {err}"
+                                )));
+                            }
+                            Task::none()
+                        }
                         Some(dashboard::Event::ResolveStreams { pane_id, streams }) => {
                             let tickers_info = self.sidebar.tickers_info();
 
@@ -320,7 +340,11 @@ impl Flowsurface {
                                     }
                                 }
                                 Err(err) => {
-                                    log::warn!("{err}",);
+                                    // This can legitimately happen during startup if ticker metadata
+                                    // isn't loaded yet. Log each distinct error once to avoid spam.
+                                    if self.persist_stream_errors_logged.insert(err.clone()) {
+                                        log::warn!("{err}");
+                                    }
                                     Task::none()
                                 }
                             }
@@ -503,7 +527,7 @@ impl Flowsurface {
 
                 return window::collect_window_specs(active_windows, Message::RestartRequested);
             }
-        }
+        };
         Task::none()
     }
 
@@ -548,15 +572,23 @@ impl Flowsurface {
                 }
             };
 
-            let base = column![
-                header_title,
-                match sidebar_pos {
-                    sidebar::Position::Left => row![sidebar_view, dashboard_view,],
-                    sidebar::Position::Right => row![dashboard_view, sidebar_view],
+            let base = match sidebar_pos {
+                sidebar::Position::Left => column![
+                    header_title,
+                    row![sidebar_view, dashboard_view].spacing(4).padding(8),
+                ],
+                sidebar::Position::Right => column![
+                    header_title,
+                    row![dashboard_view, sidebar_view].spacing(4).padding(8),
+                ],
+                sidebar::Position::Top => {
+                    // top menu bar + content below
+                    column![
+                        header_title,
+                        column![sidebar_view, dashboard_view].spacing(4).padding(8),
+                    ]
                 }
-                .spacing(4)
-                .padding(8),
-            ];
+            };
 
             if let Some(menu) = self.sidebar.active_menu() {
                 self.view_with_modal(base.into(), dashboard, menu)
@@ -581,7 +613,7 @@ impl Flowsurface {
             &self.notifications,
             match sidebar_pos {
                 sidebar::Position::Left => Alignment::Start,
-                sidebar::Position::Right => Alignment::End,
+                sidebar::Position::Right | sidebar::Position::Top => Alignment::End,
             },
             Message::RemoveNotification,
         )
@@ -621,6 +653,12 @@ impl Flowsurface {
             };
             match key {
                 keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::GoBack),
+                keyboard::Key::Character(c) if c == "+" || c == "=" => {
+                    Some(Message::ZoomFocusedPane { zoom_in: true })
+                }
+                keyboard::Key::Character(c) if c == "-" || c == "_" => {
+                    Some(Message::ZoomFocusedPane { zoom_in: false })
+                }
                 _ => None,
             }
         });
@@ -747,7 +785,11 @@ impl Flowsurface {
                     };
 
                     let sidebar_pos = pick_list(
-                        [sidebar::Position::Left, sidebar::Position::Right],
+                        [
+                            sidebar::Position::Left,
+                            sidebar::Position::Right,
+                            sidebar::Position::Top,
+                        ],
                         Some(sidebar_pos),
                         |pos| {
                             Message::Sidebar(dashboard::sidebar::Message::SetSidebarPosition(pos))
@@ -852,6 +894,7 @@ impl Flowsurface {
                 let (align_x, padding) = match sidebar_pos {
                     sidebar::Position::Left => (Alignment::Start, padding::left(44).bottom(4)),
                     sidebar::Position::Right => (Alignment::End, padding::right(44).bottom(4)),
+                    sidebar::Position::Top => (Alignment::End, padding::top(44).right(12).left(12)),
                 };
 
                 let base_content = dashboard_modal(
@@ -976,6 +1019,7 @@ impl Flowsurface {
                 let (align_x, padding) = match sidebar_pos {
                     sidebar::Position::Left => (Alignment::Start, padding::left(44).top(40)),
                     sidebar::Position::Right => (Alignment::End, padding::right(44).top(40)),
+                    sidebar::Position::Top => (Alignment::End, padding::top(44).right(12).left(12)),
                 };
 
                 dashboard_modal(
@@ -991,6 +1035,7 @@ impl Flowsurface {
                 let (align_x, padding) = match sidebar_pos {
                     sidebar::Position::Left => (Alignment::Start, padding::left(44).top(76)),
                     sidebar::Position::Right => (Alignment::End, padding::right(44).top(76)),
+                    sidebar::Position::Top => (Alignment::End, padding::top(44).right(12).left(12)),
                 };
 
                 let depth_streams_list = dashboard.streams.depth_streams(None);
@@ -1010,6 +1055,7 @@ impl Flowsurface {
                 let (align_x, padding) = match sidebar_pos {
                     sidebar::Position::Left => (Alignment::Start, padding::left(44).bottom(4)),
                     sidebar::Position::Right => (Alignment::End, padding::right(44).bottom(4)),
+                    sidebar::Position::Top => (Alignment::End, padding::top(44).right(12).left(12)),
                 };
 
                 dashboard_modal(

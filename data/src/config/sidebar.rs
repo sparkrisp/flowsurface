@@ -52,6 +52,7 @@ pub enum Position {
     #[default]
     Left,
     Right,
+    Top,
 }
 
 impl std::fmt::Display for Position {
@@ -59,6 +60,7 @@ impl std::fmt::Display for Position {
         match self {
             Position::Left => write!(f, "Left"),
             Position::Right => write!(f, "Right"),
+            Position::Top => write!(f, "Top"),
         }
     }
 }

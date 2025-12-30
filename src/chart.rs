@@ -24,6 +24,26 @@ use iced::{
 const ZOOM_SENSITIVITY: f32 = 30.0;
 const TEXT_SIZE: f32 = 12.0;
 
+/// Programmatic zoom (keyboard) centered on the chart view.
+/// `delta_y` uses the same sign convention as mouse wheel: positive zooms in, negative zooms out.
+pub fn zoom_center<T: Chart>(chart: &mut T, delta_y: f32) {
+    let max_scaling = T::max_scaling(chart);
+    let min_scaling = T::min_scaling(chart);
+
+    let state = chart.mut_state();
+
+    if !((delta_y < 0.0 && state.scaling > min_scaling) || (delta_y > 0.0 && state.scaling < max_scaling))
+    {
+        return;
+    }
+
+    let scaling = (state.scaling * (1.0 + delta_y / ZOOM_SENSITIVITY)).clamp(min_scaling, max_scaling);
+    state.scaling = scaling;
+    state.layout.autoscale = None;
+
+    chart.invalidate_all();
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub enum Interaction {
     #[default]
@@ -57,6 +77,8 @@ pub enum Message {
     BoundsChanged(Rectangle),
     SplitDragged(usize, f32),
     DoubleClick(AxisScaleClicked),
+    /// Request a context menu at the given cursor position (within chart bounds).
+    ContextMenuRequested(Point),
 }
 
 pub trait Chart: PlotConstants + canvas::Program<Message> {
@@ -120,27 +142,34 @@ fn canvas_interaction<T: Chart>(
                 mouse::Event::ButtonPressed(button) => {
                     let cursor_in_bounds = cursor_position?;
 
-                    if let mouse::Button::Left = button {
-                        match interaction {
-                            Interaction::None
-                            | Interaction::Panning { .. }
-                            | Interaction::Zoomin { .. } => {
-                                *interaction = Interaction::Panning {
-                                    translation: state.translation,
-                                    start: cursor_in_bounds,
-                                };
+                    match button {
+                        mouse::Button::Left => {
+                            match interaction {
+                                Interaction::None
+                                | Interaction::Panning { .. }
+                                | Interaction::Zoomin { .. } => {
+                                    *interaction = Interaction::Panning {
+                                        translation: state.translation,
+                                        start: cursor_in_bounds,
+                                    };
+                                }
+                                Interaction::Ruler { start } if start.is_none() => {
+                                    *interaction = Interaction::Ruler {
+                                        start: Some(cursor_in_bounds),
+                                    };
+                                }
+                                Interaction::Ruler { .. } => {
+                                    *interaction = Interaction::None;
+                                }
                             }
-                            Interaction::Ruler { start } if start.is_none() => {
-                                *interaction = Interaction::Ruler {
-                                    start: Some(cursor_in_bounds),
-                                };
-                            }
-                            Interaction::Ruler { .. } => {
-                                *interaction = Interaction::None;
-                            }
+                            Some(canvas::Action::request_redraw().and_capture())
                         }
+                        mouse::Button::Right => Some(
+                            canvas::Action::publish(Message::ContextMenuRequested(cursor_in_bounds))
+                                .and_capture(),
+                        ),
+                        _ => Some(canvas::Action::capture()),
                     }
-                    Some(canvas::Action::request_redraw().and_capture())
                 }
                 mouse::Event::CursorMoved { .. } => match *interaction {
                     Interaction::Panning { translation, start } => {
@@ -280,6 +309,9 @@ pub enum Action {
 
 pub fn update<T: Chart>(chart: &mut T, message: &Message) {
     match message {
+        Message::ContextMenuRequested(_) => {
+            // UI-only; handled at pane level. Chart state doesn't change.
+        }
         Message::DoubleClick(scale) => {
             let default_chart_width = T::default_cell_width(chart);
             let autoscaled_coords = chart.autoscaled_coords();
@@ -1140,7 +1172,15 @@ fn request_fetch(handler: &mut RequestHandler, range: FetchRange) -> Option<Acti
         }
         Ok(None) => None,
         Err(reason) => {
-            log::error!("Failed to request {:?}: {}", range, reason);
+            // Overlaps are expected when requests are pending - don't log to reduce noise
+            match &reason {
+                exchange::fetcher::ReqError::Overlaps => {
+                    // Silently ignore overlaps - they're expected behavior
+                }
+                _ => {
+                    log::error!("Failed to request {:?}: {}", range, reason);
+                }
+            }
             // TODO: handle this more explicitly, maybe by returning Action::ErrorOccurred
             None
         }

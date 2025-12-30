@@ -64,8 +64,10 @@ impl RequestHandler {
         let request = FetchRequest::new(fetch);
         let id = Uuid::new_v4();
 
+        // Treat any overlapping pending request of the same type as a duplicate.
+        // This prevents request storms when the UI requests nearby/overlapping ranges repeatedly.
         if let Some((existing_id, existing_req)) = self.requests.iter().find_map(|(k, v)| {
-            if v.same_with(&request) {
+            if v.overlaps_with(&request) {
                 Some((*k, v))
             } else {
                 None
@@ -135,15 +137,24 @@ impl FetchRequest {
         }
     }
 
-    fn same_with(&self, other: &FetchRequest) -> bool {
+    fn overlaps_with(&self, other: &FetchRequest) -> bool {
+        fn ranges_overlap(s1: u64, e1: u64, s2: u64, e2: u64) -> bool {
+            let start = s1.max(s2);
+            let end = e1.min(e2);
+            start <= end
+        }
+
         match (&self.fetch_type, &other.fetch_type) {
-            (FetchRange::Kline(s1, e1), FetchRange::Kline(s2, e2)) => e1 == e2 && s1 == s2,
+            (FetchRange::Kline(s1, e1), FetchRange::Kline(s2, e2)) => ranges_overlap(*s1, *e1, *s2, *e2),
             (FetchRange::OpenInterest(s1, e1), FetchRange::OpenInterest(s2, e2)) => {
-                e1 == e2 && s1 == s2
+                ranges_overlap(*s1, *e1, *s2, *e2)
             }
+            (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => ranges_overlap(*s1, *e1, *s2, *e2),
             _ => false,
         }
     }
+
+    // NOTE: we used to have an exact-match helper here; overlap detection replaced it.
 }
 
 pub struct FetchSpec {

@@ -141,6 +141,7 @@ impl From<&pane::State> for data::Pane {
                 stream_type: streams,
                 settings: pane.settings.clone(),
                 indicators: indicators.clone(),
+                rules: pane.rules.clone(),
                 link_group: pane.link_group,
             },
             pane::Content::TimeAndSales(_) => data::Pane::TimeAndSales {
@@ -187,6 +188,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
             vec![],
             data::layout::pane::Settings::default(),
             link_group,
+            vec![],
         )),
         data::Pane::HeatmapChart {
             layout,
@@ -208,6 +210,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 stream_type,
                 settings,
                 link_group,
+                vec![],
             ))
         }
         data::Pane::KlineChart {
@@ -216,6 +219,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
             stream_type,
             settings,
             indicators,
+            rules,
             link_group,
         } => {
             let content = pane::Content::Kline {
@@ -230,6 +234,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 stream_type,
                 settings,
                 link_group,
+                rules,
             ))
         }
         data::Pane::ComparisonChart {
@@ -244,6 +249,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 stream_type,
                 settings,
                 link_group,
+                vec![],
             ))
         }
         data::Pane::TimeAndSales {
@@ -258,6 +264,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 stream_type,
                 settings,
                 link_group,
+                vec![],
             ))
         }
         data::Pane::Ladder {
@@ -272,6 +279,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 stream_type,
                 settings,
                 link_group,
+                vec![],
             ))
         }
     }

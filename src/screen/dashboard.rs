@@ -8,15 +8,19 @@ pub use sidebar::Sidebar;
 use super::DashboardError;
 use crate::{
     chart,
+    modal::pane::{self as pane_modal, Modal as PaneModal},
     screen::dashboard::tickers_table::TickersTable,
     style,
-    widget::toast::Toast,
+    widget::resize_box::ResizeBox,
+    widget::toast::{Notification, Toast},
     window::{self, Window},
 };
+use crate::audio::SoundType;
 use data::{
     UserTimezone,
     layout::{WindowSpec, pane::ContentKind},
 };
+use data::rules::{RuleCondition, RuleSpec};
 use exchange::{
     Kline, PushFrequency, StreamPairKind, TickMultiplier, TickerInfo, Timeframe, Trade,
     adapter::{
@@ -28,15 +32,264 @@ use exchange::{
 };
 
 use iced::{
-    Element, Length, Subscription, Task, Vector,
+    Alignment, Element, Length, Subscription, Task, Vector, padding,
     task::{Straw, sipper},
     widget::{
-        PaneGrid, center, container,
+        PaneGrid, center, container, mouse_area,
         pane_grid::{self, Configuration},
     },
 };
 use iced_futures::futures::TryFutureExt;
 use std::{collections::HashMap, path::PathBuf, time::Instant, vec};
+
+// === Background rule evaluation helpers (CPU thread via Task::perform) ===
+#[derive(Clone)]
+struct TickEvalSnapshot {
+    pane_id: uuid::Uuid,
+    rules: Vec<RuleSpec>,
+    prev_price: Option<f32>,
+    cur_price: Option<f32>,
+    kind: Option<data::chart::KlineChartKind>,
+    cfg: Option<data::chart::kline::Config>,
+    closes: Option<Vec<f32>>,
+    ohlcv: Option<Vec<(u64, f32, f32, f32, f32)>>,
+}
+
+fn ma_pair_from_kind(kind: &data::chart::KlineChartKind) -> Option<((data::chart::kline::MovingAverageKind, u16), (data::chart::kline::MovingAverageKind, u16))> {
+    let data::chart::KlineChartKind::CandlesStudied { studies } = kind else {
+        return None;
+    };
+    let mut fast = None;
+    let mut slow = None;
+    for s in studies {
+        match *s {
+            data::chart::kline::CandleStudy::MovingAverageFast { kind, period, .. } => {
+                fast = Some((kind, period));
+            }
+            data::chart::kline::CandleStudy::MovingAverageSlow { kind, period, .. } => {
+                slow = Some((kind, period));
+            }
+            _ => {}
+        }
+    }
+    Some((fast?, slow?))
+}
+
+fn vwap_reset_note(kind: &data::chart::KlineChartKind) -> bool {
+    let data::chart::KlineChartKind::CandlesStudied { studies } = kind else {
+        return false;
+    };
+    for s in studies {
+        if let data::chart::kline::CandleStudy::VwapBands { reset_daily_utc, .. } = *s {
+            return reset_daily_utc;
+        }
+    }
+    false
+}
+
+fn ma_last_two(closes: &[f32], kind: data::chart::kline::MovingAverageKind, period: u16) -> Option<(f32, f32)> {
+    let p = (period as usize).max(2);
+    if closes.len() < p + 1 {
+        return None;
+    }
+    match kind {
+        data::chart::kline::MovingAverageKind::SMA => {
+            let cur = closes[closes.len() - p..].iter().sum::<f32>() / p as f32;
+            let prev = closes[closes.len() - p - 1..closes.len() - 1]
+                .iter()
+                .sum::<f32>()
+                / p as f32;
+            Some((prev, cur))
+        }
+        data::chart::kline::MovingAverageKind::EMA => {
+            let k = 2.0 / (p as f32 + 1.0);
+            let start = closes.len().saturating_sub(p + 2);
+            let slice = &closes[start..];
+            let mut prev = slice[0];
+            let mut out_prev = prev;
+            for &v in slice.iter().skip(1) {
+                let next = v * k + prev * (1.0 - k);
+                out_prev = prev;
+                prev = next;
+            }
+            Some((out_prev, prev))
+        }
+    }
+}
+
+fn rsi_last_two(closes: &[f32], period: u16) -> Option<(f32, f32)> {
+    let p = (period as usize).max(2);
+    if closes.len() < p + 2 {
+        return None;
+    }
+    let start = closes.len().saturating_sub(p + 2);
+    let slice = &closes[start..];
+    let mut gains = 0.0f32;
+    let mut losses = 0.0f32;
+    for i in 1..=p {
+        let diff = slice[i] - slice[i - 1];
+        if diff >= 0.0 { gains += diff; } else { losses += -diff; }
+    }
+    let mut avg_gain = gains / p as f32;
+    let mut avg_loss = losses / p as f32;
+    let rsi = |ag: f32, al: f32| -> f32 {
+        if al == 0.0 { 100.0 } else {
+            let rs = ag / al;
+            100.0 - (100.0 / (1.0 + rs))
+        }
+    };
+    let mut prev_rsi = rsi(avg_gain, avg_loss);
+    let mut cur_rsi = prev_rsi;
+    for i in (p + 1)..slice.len() {
+        let diff = slice[i] - slice[i - 1];
+        let gain = if diff > 0.0 { diff } else { 0.0 };
+        let loss = if diff < 0.0 { -diff } else { 0.0 };
+        avg_gain = (avg_gain * (p as f32 - 1.0) + gain) / p as f32;
+        avg_loss = (avg_loss * (p as f32 - 1.0) + loss) / p as f32;
+        prev_rsi = cur_rsi;
+        cur_rsi = rsi(avg_gain, avg_loss);
+    }
+    Some((prev_rsi, cur_rsi))
+}
+
+fn ema(values: &[f32], period: usize) -> Vec<f32> {
+    if values.is_empty() { return vec![]; }
+    let k = 2.0 / (period as f32 + 1.0);
+    let mut out = Vec::with_capacity(values.len());
+    let mut prev = values[0];
+    out.push(prev);
+    for &v in values.iter().skip(1) {
+        prev = v * k + prev * (1.0 - k);
+        out.push(prev);
+    }
+    out
+}
+
+fn macd_last_two(closes: &[f32], fast: u16, slow: u16, signal: u16) -> Option<((f32, f32), (f32, f32))> {
+    let fast = (fast as usize).max(2);
+    let slow = (slow as usize).max(3);
+    let signal = (signal as usize).max(2);
+    if closes.len() < 3 { return None; }
+    let start = closes.len().saturating_sub(slow + signal + 10);
+    let slice = &closes[start..];
+    let ema_fast = ema(slice, fast);
+    let ema_slow = ema(slice, slow);
+    let mut macd_line = Vec::with_capacity(slice.len());
+    for i in 0..slice.len() { macd_line.push(ema_fast[i] - ema_slow[i]); }
+    let signal_line = ema(&macd_line, signal);
+    if macd_line.len() >= 2 && signal_line.len() >= 2 {
+        let pm = macd_line[macd_line.len() - 2];
+        let cm = macd_line[macd_line.len() - 1];
+        let ps = signal_line[signal_line.len() - 2];
+        let cs = signal_line[signal_line.len() - 1];
+        Some(((pm, ps), (cm, cs)))
+    } else { None }
+}
+
+fn vwap_last_two(ohlcv: &[(u64, f32, f32, f32, f32)], reset_daily_utc: bool) -> Option<(f32, f32)> {
+    if ohlcv.len() < 2 { return None; }
+    let start_idx = if reset_daily_utc {
+        let day_ms = 86_400_000u64;
+        let last_day = ohlcv[ohlcv.len() - 1].0 / day_ms;
+        ohlcv.iter().rposition(|(t, _, _, _, _)| (*t / day_ms) != last_day).map(|i| i + 1).unwrap_or(0)
+    } else { 0 };
+    let mut sum_w = 0.0f32;
+    let mut sum_wx = 0.0f32;
+    let mut out = Vec::with_capacity(ohlcv.len().saturating_sub(start_idx));
+    for &(_, _, _, close, vol) in &ohlcv[start_idx..] {
+        sum_w += vol;
+        sum_wx += close * vol;
+        if sum_w > 0.0 { out.push(sum_wx / sum_w); }
+    }
+    if out.len() >= 2 { Some((out[out.len()-2], out[out.len()-1])) } else { None }
+}
+
+fn eval_tick_rules(snapshot: TickEvalSnapshot) -> Vec<uuid::Uuid> {
+    let mut triggered = Vec::new();
+    let prev = snapshot.prev_price;
+    let cur = snapshot.cur_price;
+    let kind = snapshot.kind;
+    let cfg = snapshot.cfg;
+    let closes = snapshot.closes.unwrap_or_default();
+    let ohlcv = snapshot.ohlcv.unwrap_or_default();
+
+    for rule in &snapshot.rules {
+        if !rule.enabled { continue; }
+        if !matches!(rule.evaluation, data::rules::EvaluationMode::OnTick | data::rules::EvaluationMode::Both) {
+            continue;
+        }
+        let ok = match &rule.condition {
+            RuleCondition::PriceCrossLevel { level, direction } => {
+                match (prev, cur) {
+                    (Some(p), Some(c)) => match direction {
+                        data::rules::CrossDirection::CrossUp => p < *level && c >= *level,
+                        data::rules::CrossDirection::CrossDown => p > *level && c <= *level,
+                    },
+                    _ => false,
+                }
+            }
+            RuleCondition::MovingAverageCross { direction } => {
+                if let Some(kind) = kind.as_ref()
+                    && let Some(((fk, fp), (sk, sp))) = ma_pair_from_kind(kind)
+                    && let Some((pf, cf)) = ma_last_two(&closes, fk, fp)
+                    && let Some((ps, cs)) = ma_last_two(&closes, sk, sp)
+                {
+                    match direction {
+                        data::rules::CrossDirection::CrossUp => pf < ps && cf >= cs,
+                        data::rules::CrossDirection::CrossDown => pf > ps && cf <= cs,
+                    }
+                } else {
+                    false
+                }
+            }
+            RuleCondition::RsiCrossLevel { level, direction } => {
+                if let Some(cfg) = cfg.as_ref()
+                    && let Some((pr, cr)) = rsi_last_two(&closes, cfg.rsi_period)
+                {
+                    match direction {
+                        data::rules::CrossDirection::CrossUp => pr < *level && cr >= *level,
+                        data::rules::CrossDirection::CrossDown => pr > *level && cr <= *level,
+                    }
+                } else {
+                    false
+                }
+            }
+            RuleCondition::MacdCrossSignal { direction } => {
+                if let Some(cfg) = cfg.as_ref()
+                    && let Some(((pm, ps), (cm, cs))) =
+                        macd_last_two(&closes, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
+                {
+                    match direction {
+                        data::rules::CrossDirection::CrossUp => pm < ps && cm >= cs,
+                        data::rules::CrossDirection::CrossDown => pm > ps && cm <= cs,
+                    }
+                } else {
+                    false
+                }
+            }
+            RuleCondition::VwapCross { direction } => {
+                if let (Some(p), Some(c)) = (prev, cur) {
+                    let reset = kind.as_ref().map(vwap_reset_note).unwrap_or(false);
+                    if let Some((_pv, vwap)) = vwap_last_two(&ohlcv, reset) {
+                        match direction {
+                            data::rules::CrossDirection::CrossUp => p < vwap && c >= vwap,
+                            data::rules::CrossDirection::CrossDown => p > vwap && c <= vwap,
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            // Remaining tick-evals are kept on candle-close to avoid heavy math on every trade.
+            _ => false,
+        };
+        if ok { triggered.push(rule.id); }
+    }
+
+    triggered
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -52,6 +305,12 @@ pub enum Message {
         data: FetchedData,
     },
     ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
+    PlaySound(SoundType),
+    RuleEvalTickDone {
+        pane_id: uuid::Uuid,
+        triggered: Vec<uuid::Uuid>,
+    },
+    NoOp,
 }
 
 pub struct Dashboard {
@@ -77,6 +336,7 @@ impl Default for Dashboard {
 #[derive(Debug, Clone)]
 pub enum Event {
     Notification(Toast),
+    PlaySound(SoundType),
     DistributeFetchedData {
         layout_id: uuid::Uuid,
         pane_id: uuid::Uuid,
@@ -90,6 +350,19 @@ pub enum Event {
 }
 
 impl Dashboard {
+    pub fn zoom_focused_pane(&mut self, delta_y: f32, main_window_id: window::Id) {
+        let Some((window, pane_id)) = self.focus else { return; };
+
+        if window == main_window_id {
+            if let Some(state) = self.panes.get_mut(pane_id) {
+                state.zoom_focused_chart(delta_y);
+            }
+        } else if let Some((panes, _spec)) = self.popout.get_mut(&window) {
+            if let Some(state) = panes.get_mut(pane_id) {
+                state.zoom_focused_chart(delta_y);
+            }
+        }
+    }
     fn default_pane_config() -> Configuration<pane::State> {
         Configuration::Split {
             axis: pane_grid::Axis::Vertical,
@@ -179,6 +452,132 @@ impl Dashboard {
         layout_id: &uuid::Uuid,
     ) -> (Task<Message>, Option<Event>) {
         match message {
+            Message::RuleEvalTickDone { pane_id, triggered } => {
+                let mut tasks: Vec<Task<Message>> = vec![];
+                let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) else {
+                    return (Task::none(), None);
+                };
+
+                for rule_id in triggered {
+                    let Some(rule) = state.rules.iter().find(|r| r.id == rule_id).cloned() else {
+                        continue;
+                    };
+                    if !rule.enabled
+                        || !matches!(
+                            rule.evaluation,
+                            data::rules::EvaluationMode::OnTick | data::rules::EvaluationMode::Both
+                        )
+                    {
+                        continue;
+                    }
+
+                    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    if !state.cooldown_allows(&rule, now_ms) {
+                        continue;
+                    }
+
+                    let mut parts: Vec<String> = vec!["triggered (tick)".to_string()];
+                    let mut toast_msg: Option<String> = None;
+                    let mut fill_msg: Option<String> = None;
+
+                    for action in &rule.actions {
+                        match action {
+                            data::rules::RuleAction::Toast { message } => {
+                                parts.push(format!("toast: {message}"));
+                                toast_msg = Some(message.clone());
+                            }
+                            data::rules::RuleAction::PaperTrade {
+                                side,
+                                percent_of_balance,
+                            } => {
+                                let Some(price) = state.current_price() else { continue; };
+                                if let Some(fill) =
+                                    state.paper_trade(*side, *percent_of_balance, price)
+                                {
+                                    parts.push(fill.clone());
+                                    fill_msg = Some(fill);
+                                }
+                            }
+                            data::rules::RuleAction::Sound { enabled } => {
+                                if *enabled {
+                                    parts.push("sound".to_string());
+                                    let dir = match &rule.condition {
+                                        data::rules::RuleCondition::PriceCrossLevel { direction, .. }
+                                        | data::rules::RuleCondition::CandleCloseCrossLevel { direction, .. }
+                                        | data::rules::RuleCondition::MovingAverageCross { direction }
+                                        | data::rules::RuleCondition::RsiCrossLevel { direction, .. }
+                                        | data::rules::RuleCondition::MacdCrossSignal { direction }
+                                        | data::rules::RuleCondition::VwapCross { direction }
+                                        | data::rules::RuleCondition::SupertrendFlip { direction }
+                                        | data::rules::RuleCondition::SupertrendLineCross { direction }
+                                        | data::rules::RuleCondition::DonchianBreakout { direction }
+                                        | data::rules::RuleCondition::KeltnerBreakout { direction }
+                                        | data::rules::RuleCondition::DmiCross { direction } => *direction,
+                                        _ => data::rules::CrossDirection::CrossUp,
+                                    };
+                                    let sound = match dir {
+                                        data::rules::CrossDirection::CrossUp => crate::audio::SoundType::Buy,
+                                        data::rules::CrossDirection::CrossDown => crate::audio::SoundType::Sell,
+                                    };
+                                    tasks.push(Task::done(Message::PlaySound(sound)));
+                                }
+                            }
+                            data::rules::RuleAction::Telegram { enabled } => {
+                                if *enabled {
+                                    parts.push("telegram".to_string());
+                                    let ticker = state
+                                        .stream_pair()
+                                        .map(|ti| format!("{}", ti.ticker))
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    let text = format!("[Rule] {ticker}: {}", rule.name);
+                                    tasks.push(Task::perform(crate::telegram::send_message(text), |res| {
+                                        match res {
+                                            Ok(()) => Message::NoOp,
+                                            Err(e) => Message::Notification(Toast::warn(format!(
+                                                "Telegram: {e}"
+                                            ))),
+                                        }
+                                    }));
+                                }
+                            }
+                            data::rules::RuleAction::Push { enabled } => {
+                                if *enabled {
+                                    parts.push("push".to_string());
+                                    let ticker = state
+                                        .stream_pair()
+                                        .map(|ti| format!("{}", ti.ticker))
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    let text = format!("[Rule] {ticker}: {} (tick)", rule.name);
+                                    tasks.push(Task::perform(crate::push::send_message(text), |res| {
+                                        match res {
+                                            Ok(()) => Message::NoOp,
+                                            Err(e) => Message::Notification(Toast::warn(format!(
+                                                "Push: {e}"
+                                            ))),
+                                        }
+                                    }));
+                                }
+                            }
+                        }
+                    }
+
+                    if toast_msg.is_some() || fill_msg.is_some() {
+                        let mut msg = format!(
+                            "[Rule] {}: {}",
+                            rule.name,
+                            toast_msg.unwrap_or_else(|| "Triggered".to_string())
+                        );
+                        if let Some(fill) = fill_msg {
+                            msg = format!("{msg} | {fill}");
+                        }
+                        state.push_notification(Toast::new(Notification::Info(msg)));
+                    }
+
+                    state.push_rule_log(&rule, parts.join(" | "));
+                }
+
+                return (Task::batch(tasks), None);
+            }
             Message::SavePopoutSpecs(specs) => {
                 for (window_id, new_spec) in specs {
                     if let Some((_, spec)) = self.popout.get_mut(&window_id) {
@@ -244,6 +643,9 @@ impl Dashboard {
                     return (self.refresh_streams(main_window.id), None);
                 }
                 pane::Message::VisualConfigChanged(pane, cfg, to_sync) => {
+                    let mut refresh_needed = false;
+                    let mut fetch_tasks: Vec<Task<Message>> = vec![];
+
                     if to_sync {
                         if let Some(state) = self.get_pane(main_window.id, window, pane) {
                             let studies_cfg = state.content.studies();
@@ -284,6 +686,25 @@ impl Dashboard {
                                         state.settings.visual_config = Some(cfg.clone());
                                         state.content.change_visual_config(cfg.clone());
 
+                                        if let data::layout::pane::VisualConfig::Heatmap(h_cfg) =
+                                            &cfg
+                                        {
+                                            let (changed, fetch_stream) =
+                                                state.update_heatmap_overlay_streams(*h_cfg);
+                                            if changed {
+                                                refresh_needed = true;
+                                            }
+                                            if let Some(stream) = fetch_stream {
+                                                fetch_tasks.push(kline_fetch_task(
+                                                    *layout_id,
+                                                    state.unique_id(),
+                                                    stream,
+                                                    None,
+                                                    None,
+                                                ));
+                                            }
+                                        }
+
                                         if let Some(studies) = &studies_cfg {
                                             state.content.update_studies(studies.clone());
                                         }
@@ -300,7 +721,34 @@ impl Dashboard {
                         }
                     } else if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         state.settings.visual_config = Some(cfg.clone());
-                        state.content.change_visual_config(cfg);
+                        state.content.change_visual_config(cfg.clone());
+
+                        if let data::layout::pane::VisualConfig::Heatmap(h_cfg) = &cfg {
+                            let (changed, fetch_stream) =
+                                state.update_heatmap_overlay_streams(*h_cfg);
+                            if changed {
+                                refresh_needed = true;
+                            }
+                            if let Some(stream) = fetch_stream {
+                                fetch_tasks.push(kline_fetch_task(
+                                    *layout_id,
+                                    state.unique_id(),
+                                    stream,
+                                    None,
+                                    None,
+                                ));
+                            }
+                        }
+                    }
+
+                    if refresh_needed {
+                        let refresh = self.refresh_streams(main_window.id);
+                        let task = if fetch_tasks.is_empty() {
+                            refresh
+                        } else {
+                            Task::batch(fetch_tasks).chain(refresh)
+                        };
+                        return (task, None);
                     }
                 }
                 pane::Message::SwitchLinkGroup(pane, group) => {
@@ -408,6 +856,10 @@ impl Dashboard {
             Message::Notification(toast) => {
                 return (Task::none(), Some(Event::Notification(toast)));
             }
+            Message::PlaySound(sound) => {
+                return (Task::none(), Some(Event::PlaySound(sound)));
+            }
+            Message::NoOp => {}
         }
 
         (Task::none(), None)
@@ -602,7 +1054,86 @@ impl Dashboard {
         .style(style::pane_grid)
         .into();
 
-        pane_grid.map(move |message| Message::Pane(main_window.id, message))
+        let base: Element<'a, Message> =
+            pane_grid.map(move |message| Message::Pane(main_window.id, message));
+
+        // Window-level modals for the focused pane (so they're not constrained by pane bounds).
+        let Some((focus_window, focus_pane)) = self.focus else {
+            return base;
+        };
+        if focus_window != main_window.id {
+            return base;
+        }
+
+        let Some(state) = self.panes.get(focus_pane) else {
+            return base;
+        };
+
+        let (modal_kind, modal_content): (
+            Option<pane::CenteredModalKind>,
+            Option<Element<'a, Message>>,
+        ) = match state.modal {
+            Some(PaneModal::Rules) => (Some(pane::CenteredModalKind::Rules), Some(
+                pane_modal::rules::view(focus_pane, state)
+                    .map(move |m| Message::Pane(main_window.id, m)),
+            )),
+            Some(PaneModal::RuleLog) => (Some(pane::CenteredModalKind::RuleLog), Some(
+                pane_modal::rule_log::view(focus_pane, state)
+                    .map(move |m| Message::Pane(main_window.id, m)),
+            )),
+            Some(PaneModal::Indicators) => {
+                let market_type = state.stream_pair().map(|i| i.ticker.market_type());
+                (Some(pane::CenteredModalKind::Indicators), Some(
+                    match &state.content {
+                        pane::Content::Kline { indicators, .. } => {
+                            pane_modal::indicators::view(focus_pane, state, indicators, market_type)
+                        }
+                        pane::Content::Heatmap { indicators, .. } => {
+                            pane_modal::indicators::view(focus_pane, state, indicators, market_type)
+                        }
+                        _ => unreachable!(),
+                    }
+                    .map(move |m| Message::Pane(main_window.id, m)),
+                ))
+            }
+            _ => (None, None),
+        };
+
+        if let Some(content) = modal_content {
+            let content: Element<'a, Message> = if let Some(kind) = modal_kind {
+                let (w, h) = match kind {
+                    pane::CenteredModalKind::Rules => state.centered_rules_size,
+                    pane::CenteredModalKind::Indicators => state.centered_indicators_size,
+                    pane::CenteredModalKind::RuleLog => state.centered_rule_log_size,
+                };
+                let on_resize = move |nw: f32, nh: f32| {
+                    Message::Pane(
+                        main_window.id,
+                        pane::Message::PaneEvent(
+                            focus_pane,
+                            pane::Event::ResizeCenteredModal(kind, nw, nh),
+                        ),
+                    )
+                };
+                ResizeBox::new(content, w, h, on_resize).into()
+            } else {
+                content
+            };
+            // Prevent click-through to the pane grid.
+            let content: Element<'a, Message> =
+                mouse_area(content).on_press(Message::NoOp).into();
+            let on_blur = Message::Pane(main_window.id, pane::Message::PaneEvent(focus_pane, pane::Event::HideModal));
+            pane_modal::stack_modal(
+                base,
+                content,
+                on_blur,
+                padding::Padding::default(),
+                Alignment::Center,
+                Alignment::Center,
+            )
+        } else {
+            base
+        }
     }
 
     pub fn view_window<'a>(
@@ -633,7 +1164,85 @@ impl Dashboard {
             .height(Length::Fill)
             .padding(8);
 
-            Element::new(content).map(move |message| Message::Pane(window, message))
+            let base: Element<'a, Message> =
+                Element::new(content).map(move |message| Message::Pane(window, message));
+
+            // Window-level modals for the focused pane in this popout window.
+            let Some((focus_window, focus_pane)) = self.focus else {
+                return base;
+            };
+            if focus_window != window {
+                return base;
+            }
+
+            let Some(pane_state) = state.get(focus_pane) else {
+                return base;
+            };
+
+            let (modal_kind, modal_content): (Option<pane::CenteredModalKind>, Option<Element<'a, Message>>) =
+                match pane_state.modal {
+                Some(PaneModal::Rules) => (Some(pane::CenteredModalKind::Rules), Some(
+                    pane_modal::rules::view(focus_pane, pane_state)
+                        .map(move |m| Message::Pane(window, m)),
+                )),
+                Some(PaneModal::RuleLog) => (Some(pane::CenteredModalKind::RuleLog), Some(
+                    pane_modal::rule_log::view(focus_pane, pane_state)
+                        .map(move |m| Message::Pane(window, m)),
+                )),
+                Some(PaneModal::Indicators) => {
+                    let market_type = pane_state.stream_pair().map(|i| i.ticker.market_type());
+                    (Some(pane::CenteredModalKind::Indicators), Some(
+                        match &pane_state.content {
+                            pane::Content::Kline { indicators, .. } => {
+                                pane_modal::indicators::view(focus_pane, pane_state, indicators, market_type)
+                            }
+                            pane::Content::Heatmap { indicators, .. } => {
+                                pane_modal::indicators::view(focus_pane, pane_state, indicators, market_type)
+                            }
+                            _ => unreachable!(),
+                        }
+                        .map(move |m| Message::Pane(window, m)),
+                    ))
+                }
+                _ => (None, None),
+            };
+
+            if let Some(content) = modal_content {
+                let content: Element<'a, Message> = if let Some(kind) = modal_kind {
+                    let (w, h) = match kind {
+                        pane::CenteredModalKind::Rules => pane_state.centered_rules_size,
+                        pane::CenteredModalKind::Indicators => pane_state.centered_indicators_size,
+                        pane::CenteredModalKind::RuleLog => pane_state.centered_rule_log_size,
+                    };
+                    let on_resize = move |nw: f32, nh: f32| {
+                        Message::Pane(
+                            window,
+                            pane::Message::PaneEvent(
+                                focus_pane,
+                                pane::Event::ResizeCenteredModal(kind, nw, nh),
+                            ),
+                        )
+                    };
+                    ResizeBox::new(content, w, h, on_resize).into()
+                } else {
+                    content
+                };
+                // Prevent click-through to the pane grid (which can change focus and effectively
+                // "close" the modal). Any click inside the modal publishes NoOp and captures it.
+                let content: Element<'a, Message> =
+                    mouse_area(content).on_press(Message::NoOp).into();
+                let on_blur = Message::Pane(window, pane::Message::PaneEvent(focus_pane, pane::Event::HideModal));
+                pane_modal::stack_modal(
+                    base,
+                    content,
+                    on_blur,
+                    padding::Padding::default(),
+                    Alignment::Center,
+                    Alignment::Center,
+                )
+            } else {
+                base
+            }
         } else {
             Element::new(center("No pane found for window"))
                 .map(move |message| Message::Pane(window, message))
@@ -924,12 +1533,20 @@ impl Dashboard {
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, pane_state)| {
                 if pane_state.matches_stream(stream) {
+                    if matches!(stream, StreamKind::Kline { .. }) {
+                        pane_state.on_kline_update(kline);
+                    }
                     match &mut pane_state.content {
                         pane::Content::Kline { chart: Some(c), .. } => {
                             c.update_latest_kline(kline);
                         }
                         pane::Content::Comparison(Some(c)) => {
                             c.update_latest_kline(&stream.ticker_info(), kline);
+                        }
+                        pane::Content::Heatmap { chart: Some(c), .. } => {
+                            if c.visual_config().show_candles {
+                                c.on_insert_klines(&[*kline]);
+                            }
                         }
                         _ => {}
                     }
@@ -958,6 +1575,7 @@ impl Dashboard {
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, pane_state)| {
                 if pane_state.matches_stream(stream) {
+                    pane_state.on_trades_buffer(trades_buffer);
                     match &mut pane_state.content {
                         pane::Content::Heatmap { chart, .. } => {
                             if let Some(c) = chart {
@@ -1039,6 +1657,181 @@ impl Dashboard {
                 },
                 None => {}
             });
+
+        // Rules evaluation (MVP): OnTick (price crosses) + OnCandleClose (close/volume)
+        self.iter_all_panes_mut(main_window).for_each(|(_, _, state)| {
+            let rules_snapshot = state.rules.clone();
+
+            // OnTick evaluation (background): schedule heavy rule math off the UI thread.
+            let wants_tick = rules_snapshot.iter().any(|r| {
+                r.enabled
+                    && matches!(
+                        r.evaluation,
+                        data::rules::EvaluationMode::OnTick | data::rules::EvaluationMode::Both
+                    )
+            });
+            let allow_tick_eval = wants_tick
+                && state.rule_tick_dirty
+                && state.rule_tick_last_eval.elapsed().as_millis() >= 150;
+
+            if allow_tick_eval {
+                state.rule_tick_dirty = false;
+                state.rule_tick_last_eval = now;
+
+                // Only snapshot series if any rule needs them.
+                let needs_closes = rules_snapshot.iter().any(|r| {
+                    matches!(
+                        r.condition,
+                        RuleCondition::MovingAverageCross { .. }
+                            | RuleCondition::RsiCrossLevel { .. }
+                            | RuleCondition::MacdCrossSignal { .. }
+                    )
+                });
+                let needs_ohlcv = rules_snapshot
+                    .iter()
+                    .any(|r| matches!(r.condition, RuleCondition::VwapCross { .. }));
+
+                let (kind, cfg, closes, ohlcv) = match &state.content {
+                    pane::Content::Kline { chart: Some(c), kind, .. } => (
+                        Some(kind.clone()),
+                        Some(c.visual_config()),
+                        needs_closes.then(|| c.close_series()),
+                        needs_ohlcv.then(|| c.ohlcv_series()),
+                    ),
+                    _ => (None, None, None, None),
+                };
+
+                let snapshot = TickEvalSnapshot {
+                    pane_id: state.unique_id(),
+                    rules: rules_snapshot.clone(),
+                    prev_price: state.prev_trade_price,
+                    cur_price: state.last_trade_price,
+                    kind,
+                    cfg,
+                    closes,
+                    ohlcv,
+                };
+                let pane_id = snapshot.pane_id;
+                tasks.push(Task::perform(async move { eval_tick_rules(snapshot) }, move |triggered| {
+                    Message::RuleEvalTickDone { pane_id, triggered }
+                }));
+            }
+
+            // Candle-close evaluation (best-effort based on kline time updates)
+            if let Some((_t, close, vol)) = state.pending_candle_close.take() {
+                for rule in &rules_snapshot {
+                    if !rule.enabled {
+                        continue;
+                    }
+                    if matches!(
+                        rule.evaluation,
+                        data::rules::EvaluationMode::OnCandleClose | data::rules::EvaluationMode::Both
+                    ) && state.eval_condition_candle_close(rule, close, vol)
+                    {
+                        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                        if !state.cooldown_allows(rule, now_ms) {
+                            continue;
+                        }
+
+                        let mut parts: Vec<String> = vec!["triggered (candle close)".to_string()];
+                        let mut toast_msg: Option<String> = None;
+                        let mut fill_msg: Option<String> = None;
+
+                        for action in &rule.actions {
+                            match action {
+                                data::rules::RuleAction::Toast { message } => {
+                                    parts.push(format!("toast: {message}"));
+                                    toast_msg = Some(message.clone());
+                                }
+                                data::rules::RuleAction::PaperTrade { side, percent_of_balance } => {
+                                    if let Some(fill) = state.paper_trade(*side, *percent_of_balance, close) {
+                                        parts.push(fill.clone());
+                                        fill_msg = Some(format!("{fill} (on close)"));
+                                    }
+                                }
+                                data::rules::RuleAction::Sound { enabled } => {
+                                    if *enabled {
+                                        parts.push("sound".to_string());
+                                        let dir = match &rule.condition {
+                                            data::rules::RuleCondition::PriceCrossLevel { direction, .. }
+                                            | data::rules::RuleCondition::CandleCloseCrossLevel { direction, .. }
+                                            | data::rules::RuleCondition::MovingAverageCross { direction }
+                                            | data::rules::RuleCondition::RsiCrossLevel { direction, .. }
+                                            | data::rules::RuleCondition::MacdCrossSignal { direction }
+                                            | data::rules::RuleCondition::VwapCross { direction }
+                                            | data::rules::RuleCondition::SupertrendFlip { direction }
+                                            | data::rules::RuleCondition::SupertrendLineCross { direction }
+                                            | data::rules::RuleCondition::DonchianBreakout { direction }
+                                            | data::rules::RuleCondition::KeltnerBreakout { direction }
+                                            | data::rules::RuleCondition::DmiCross { direction } => *direction,
+                                            _ => data::rules::CrossDirection::CrossUp,
+                                        };
+                                        let sound = match dir {
+                                            data::rules::CrossDirection::CrossUp => crate::audio::SoundType::Buy,
+                                            data::rules::CrossDirection::CrossDown => crate::audio::SoundType::Sell,
+                                        };
+                                        tasks.push(Task::done(Message::PlaySound(sound)));
+                                    }
+                                }
+                                data::rules::RuleAction::Telegram { enabled } => {
+                                    if *enabled {
+                                        parts.push("telegram".to_string());
+                                        let ticker = state
+                                            .stream_pair()
+                                            .map(|ti| format!("{}", ti.ticker))
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        let text = format!("[Rule] {ticker}: {} (close)", rule.name);
+                                        tasks.push(Task::perform(
+                                            crate::telegram::send_message(text),
+                                            |res| match res {
+                                                Ok(()) => Message::NoOp,
+                                                Err(e) => Message::Notification(Toast::warn(format!(
+                                                    "Telegram: {e}"
+                                                ))),
+                                            },
+                                        ));
+                                    }
+                                }
+                                data::rules::RuleAction::Push { enabled } => {
+                                    if *enabled {
+                                        parts.push("push".to_string());
+                                        let ticker = state
+                                            .stream_pair()
+                                            .map(|ti| format!("{}", ti.ticker))
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        let text = format!("[Rule] {ticker}: {} (close)", rule.name);
+                                        tasks.push(Task::perform(
+                                            crate::push::send_message(text),
+                                            |res| match res {
+                                                Ok(()) => Message::NoOp,
+                                                Err(e) => Message::Notification(Toast::warn(format!(
+                                                    "Push: {e}"
+                                                ))),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        if toast_msg.is_some() || fill_msg.is_some() {
+                            let mut msg = format!(
+                                "[Rule] {}: {}",
+                                rule.name,
+                                toast_msg.unwrap_or_else(|| "Triggered".to_string())
+                            );
+                            if let Some(fill) = fill_msg {
+                                msg = format!("{msg} | {fill}");
+                            }
+                            state.push_notification(Toast::new(Notification::Info(msg)));
+                        }
+
+                        // persistent in-session log (survives toast timeout)
+                        state.push_rule_log(rule, parts.join(" | "));
+                    }
+                }
+            }
+        });
 
         Task::batch(tasks)
     }

@@ -11,7 +11,10 @@ use data::chart::kline::ClusterScaling;
 use data::chart::{
     KlineChartKind, ViewConfig,
     indicator::{Indicator, KlineIndicator},
-    kline::{ClusterKind, FootprintStudy, KlineDataPoint, KlineTrades, NPoc, PointOfControl},
+    kline::{
+        CandleStudy, ClusterKind, Config as KlineVisualConfig, FootprintStudy, KlineDataPoint,
+        KlineTrades, MovingAverageKind, NPoc, PointOfControl,
+    },
 };
 use data::util::{abbr_large_numbers, count_decimals};
 use exchange::util::{Price, PriceStep};
@@ -81,13 +84,18 @@ impl Chart for KlineChart {
             return None;
         }
 
+        // Check if chart is empty to avoid overflow
+        if self.is_empty() {
+            return None;
+        }
+
         match &chart.basis {
             Basis::Time(timeframe) => {
                 let interval = timeframe.to_milliseconds();
 
                 let (earliest, latest) = (
-                    chart.x_to_interval(region.x) - (interval / 2),
-                    chart.x_to_interval(region.x + region.width) + (interval / 2),
+                    chart.x_to_interval(region.x).saturating_sub(interval / 2),
+                    chart.x_to_interval(region.x + region.width).saturating_add(interval / 2),
                 );
 
                 Some((earliest, latest))
@@ -117,7 +125,7 @@ impl Chart for KlineChart {
             KlineChartKind::Footprint { .. } => {
                 0.5 * (chart.bounds.width / chart.scaling) - (chart.cell_width / chart.scaling)
             }
-            KlineChartKind::Candles => {
+            KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => {
                 0.5 * (chart.bounds.width / chart.scaling)
                     - (8.0 * chart.cell_width / chart.scaling)
             }
@@ -174,9 +182,12 @@ pub struct KlineChart {
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
     fetching_trades: (bool, Option<Handle>),
     pub(crate) kind: KlineChartKind,
+    visual_config: KlineVisualConfig,
     request_handler: RequestHandler,
     study_configurator: study::Configurator<FootprintStudy>,
+    candle_study_configurator: study::Configurator<CandleStudy>,
     last_tick: Instant,
+    last_missing_data_check: Instant,
 }
 
 impl KlineChart {
@@ -202,7 +213,7 @@ impl KlineChart {
                 let (scale_high, scale_low) = timeseries.price_scale({
                     match kind {
                         KlineChartKind::Footprint { .. } => 12,
-                        KlineChartKind::Candles => 60,
+                        KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => 60,
                     }
                 });
 
@@ -216,11 +227,11 @@ impl KlineChart {
 
                 let cell_width = match kind {
                     KlineChartKind::Footprint { .. } => 80.0,
-                    KlineChartKind::Candles => 4.0,
+                    KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => 4.0,
                 };
                 let cell_height = match kind {
                     KlineChartKind::Footprint { .. } => 800.0 / y_ticks,
-                    KlineChartKind::Candles => 200.0 / y_ticks,
+                    KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => 200.0 / y_ticks,
                 };
 
                 let mut chart = ViewState::new(
@@ -243,7 +254,7 @@ impl KlineChart {
                         0.5 * (chart.bounds.width / chart.scaling)
                             - (chart.cell_width / chart.scaling)
                     }
-                    KlineChartKind::Candles => {
+                    KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => {
                         0.5 * (chart.bounds.width / chart.scaling)
                             - (8.0 * chart.cell_width / chart.scaling)
                     }
@@ -256,6 +267,7 @@ impl KlineChart {
                 for &i in enabled_indicators {
                     let mut indi = indicator::kline::make_empty(i);
                     indi.rebuild_from_source(&data_source);
+                    indi.on_kline_visual_config_changed(&KlineVisualConfig::default(), &data_source);
                     indicators[i] = Some(indi);
                 }
 
@@ -267,8 +279,11 @@ impl KlineChart {
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::new(),
                     kind: kind.clone(),
+                    visual_config: KlineVisualConfig::default(),
                     study_configurator: study::Configurator::new(),
+                    candle_study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    last_missing_data_check: Instant::now(),
                 }
             }
             Basis::Tick(interval) => {
@@ -276,11 +291,11 @@ impl KlineChart {
 
                 let cell_width = match kind {
                     KlineChartKind::Footprint { .. } => 80.0,
-                    KlineChartKind::Candles => 4.0,
+                    KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => 4.0,
                 };
                 let cell_height = match kind {
                     KlineChartKind::Footprint { .. } => 90.0,
-                    KlineChartKind::Candles => 8.0,
+                    KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => 8.0,
                 };
 
                 let mut chart = ViewState::new(
@@ -301,7 +316,7 @@ impl KlineChart {
                         0.5 * (chart.bounds.width / chart.scaling)
                             - (chart.cell_width / chart.scaling)
                     }
-                    KlineChartKind::Candles => {
+                    KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => {
                         0.5 * (chart.bounds.width / chart.scaling)
                             - (8.0 * chart.cell_width / chart.scaling)
                     }
@@ -314,6 +329,7 @@ impl KlineChart {
                 for &i in enabled_indicators {
                     let mut indi = indicator::kline::make_empty(i);
                     indi.rebuild_from_source(&data_source);
+                    indi.on_kline_visual_config_changed(&KlineVisualConfig::default(), &data_source);
                     indicators[i] = Some(indi);
                 }
 
@@ -325,8 +341,11 @@ impl KlineChart {
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::new(),
                     kind: kind.clone(),
+                    visual_config: KlineVisualConfig::default(),
                     study_configurator: study::Configurator::new(),
+                    candle_study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    last_missing_data_check: Instant::now(),
                 }
             }
         }
@@ -340,7 +359,10 @@ impl KlineChart {
                 self.indicators
                     .values_mut()
                     .filter_map(Option::as_mut)
-                    .for_each(|indi| indi.on_insert_klines(&[*kline]));
+                    .for_each(|indi| {
+                        indi.on_insert_klines(&[*kline]);
+                        indi.on_source_updated(&self.data_source);
+                    });
 
                 let chart = self.mut_state();
 
@@ -358,11 +380,96 @@ impl KlineChart {
         &self.kind
     }
 
+    pub fn visual_config(&self) -> KlineVisualConfig {
+        self.visual_config
+    }
+
+    pub fn close_series(&self) -> Vec<f32> {
+        match &self.data_source {
+            PlotData::TimeBased(ts) => ts
+                .datapoints
+                .values()
+                .map(|dp| dp.kline.close.to_f32_lossy())
+                .collect(),
+            PlotData::TickBased(tick) => tick
+                .datapoints
+                .iter()
+                .map(|dp| dp.kline.close.to_f32_lossy())
+                .collect(),
+        }
+    }
+
+    /// Returns a best-effort OHLCV series for rule evaluation / indicator math.
+    ///
+    /// - Time is the kline open time (ms since epoch)
+    /// - Volume is total volume (buy + sell)
+    pub fn ohlcv_series(&self) -> Vec<(u64, f32, f32, f32, f32)> {
+        match &self.data_source {
+            PlotData::TimeBased(ts) => ts
+                .datapoints
+                .values()
+                .map(|dp| {
+                    (
+                        dp.kline.time,
+                        dp.kline.high.to_f32_lossy(),
+                        dp.kline.low.to_f32_lossy(),
+                        dp.kline.close.to_f32_lossy(),
+                        dp.kline.volume.0 + dp.kline.volume.1,
+                    )
+                })
+                .collect(),
+            PlotData::TickBased(tick) => tick
+                .datapoints
+                .iter()
+                .map(|dp| {
+                    (
+                        dp.kline.time,
+                        dp.kline.high.to_f32_lossy(),
+                        dp.kline.low.to_f32_lossy(),
+                        dp.kline.close.to_f32_lossy(),
+                        dp.kline.volume.0 + dp.kline.volume.1,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub fn last_two_closes(&self) -> Option<(f32, f32)> {
+        let closes = self.close_series();
+        if closes.len() >= 2 {
+            Some((closes[closes.len() - 2], closes[closes.len() - 1]))
+        } else {
+            None
+        }
+    }
+
+    pub fn latest_volume_total(&self) -> Option<f32> {
+        match &self.data_source {
+            PlotData::TimeBased(ts) => ts
+                .datapoints
+                .last_key_value()
+                .map(|(_, dp)| dp.kline.volume.0 + dp.kline.volume.1),
+            PlotData::TickBased(tick) => tick
+                .datapoints
+                .last()
+                .map(|dp| dp.kline.volume.0 + dp.kline.volume.1),
+        }
+    }
+
+    pub fn set_visual_config(&mut self, cfg: KlineVisualConfig) {
+        self.visual_config = cfg;
+        for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
+            indi.on_kline_visual_config_changed(&self.visual_config, &self.data_source);
+        }
+        self.invalidate(None);
+    }
+
     fn missing_data_task(&mut self) -> Option<Action> {
         match &self.data_source {
             PlotData::TimeBased(timeseries) => {
                 let timeframe_ms = timeseries.interval.to_milliseconds();
 
+                // Early return if no data - this is the most common case and avoids expensive operations
                 if timeseries.datapoints.is_empty() {
                     let latest = chrono::Utc::now().timestamp_millis() as u64;
                     let earliest = latest.saturating_sub(450 * timeframe_ms);
@@ -371,9 +478,16 @@ impl KlineChart {
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
+                    return None; // Early return to avoid expensive visible_timerange() call
                 }
 
-                let (visible_earliest, visible_latest) = self.visible_timerange()?;
+                // Early return if visible_timerange() fails (chart not ready, empty, etc.)
+                // This avoids expensive operations when the chart isn't ready
+                let (visible_earliest, visible_latest) = match self.visible_timerange() {
+                    Some(range) => range,
+                    None => return None,
+                };
+                
                 let (kline_earliest, kline_latest) = timeseries.timerange();
                 let earliest = visible_earliest.saturating_sub(visible_latest - visible_earliest);
 
@@ -480,6 +594,47 @@ impl KlineChart {
             }
             Some(study::Action::ConfigureStudy(study)) => {
                 if let Some(existing_study) = studies.iter_mut().find(|s| s.is_same_type(&study)) {
+                    *existing_study = study;
+                }
+            }
+            None => {}
+        }
+
+        self.invalidate(None);
+    }
+
+    pub fn candle_study_configurator(&self) -> &study::Configurator<CandleStudy> {
+        &self.candle_study_configurator
+    }
+
+    pub fn update_candle_study_configurator(&mut self, message: study::Message<CandleStudy>) {
+        // Upgrade legacy Candles -> CandlesStudied on first interaction
+        let studies_ref: &mut Vec<CandleStudy> = match &mut self.kind {
+            KlineChartKind::Candles => {
+                self.kind = KlineChartKind::CandlesStudied { studies: vec![] };
+                match &mut self.kind {
+                    KlineChartKind::CandlesStudied { studies } => studies,
+                    _ => unreachable!(),
+                }
+            }
+            KlineChartKind::CandlesStudied { studies } => studies,
+            KlineChartKind::Footprint { .. } => return,
+        };
+
+        match self.candle_study_configurator.update(message) {
+            Some(study::Action::ToggleStudy(study, is_selected)) => {
+                if is_selected {
+                    let already_exists = studies_ref.iter().any(|s| s.is_same_type(&study));
+                    if !already_exists {
+                        studies_ref.push(study);
+                    }
+                } else {
+                    studies_ref.retain(|s| !s.is_same_type(&study));
+                }
+            }
+            Some(study::Action::ConfigureStudy(study)) => {
+                if let Some(existing_study) = studies_ref.iter_mut().find(|s| s.is_same_type(&study))
+                {
                     *existing_study = study;
                 }
             }
@@ -607,7 +762,8 @@ impl KlineChart {
                     .values_mut()
                     .filter_map(Option::as_mut)
                     .for_each(|indi| {
-                        indi.on_insert_trades(trades_buffer, old_dp_len, &self.data_source)
+                        indi.on_insert_trades(trades_buffer, old_dp_len, &self.data_source);
+                        indi.on_source_updated(&self.data_source);
                     });
 
                 self.invalidate(None);
@@ -644,7 +800,10 @@ impl KlineChart {
                 self.indicators
                     .values_mut()
                     .filter_map(Option::as_mut)
-                    .for_each(|indi| indi.on_insert_klines(klines_raw));
+                    .for_each(|indi| {
+                        indi.on_insert_klines(klines_raw);
+                        indi.on_source_updated(&self.data_source);
+                    });
 
                 if klines_raw.is_empty() {
                     self.request_handler
@@ -724,7 +883,7 @@ impl KlineChart {
                             0.5 * (chart.bounds.width / chart.scaling)
                                 - (chart.cell_width / chart.scaling)
                         }
-                        KlineChartKind::Candles => {
+            KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => {
                             0.5 * (chart.bounds.width / chart.scaling)
                                 - (8.0 * chart.cell_width / chart.scaling)
                         }
@@ -793,7 +952,15 @@ impl KlineChart {
 
         if let Some(t) = now {
             self.last_tick = t;
-            self.missing_data_task()
+            // Throttle missing_data_task to avoid excessive overlapping requests
+            // Only check for missing data every 1 second to balance responsiveness and performance
+            // This prevents UI hangs while still being responsive to data needs
+            if self.last_missing_data_check.elapsed().as_millis() > 1000 {
+                self.last_missing_data_check = t;
+                self.missing_data_task()
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -964,7 +1131,7 @@ impl canvas::Program<Message> for KlineChart {
                         },
                     );
                 }
-                KlineChartKind::Candles => {
+                KlineChartKind::Candles | KlineChartKind::CandlesStudied { .. } => {
                     let candle_width = chart.cell_width * 0.8;
 
                     render_data_source(
@@ -984,6 +1151,24 @@ impl canvas::Program<Message> for KlineChart {
                             );
                         },
                     );
+
+                    // Draw candle studies overlays (e.g. Moving Averages)
+                    let studies: &[CandleStudy] = match &self.kind {
+                        KlineChartKind::CandlesStudied { studies } => studies,
+                        _ => &[],
+                    };
+                    if !studies.is_empty() {
+                        draw_candle_studies(
+                            frame,
+                            &self.data_source,
+                            studies,
+                            earliest,
+                            latest,
+                            &interval_to_x,
+                            &price_to_y,
+                            palette,
+                        );
+                    }
                 }
             }
 
@@ -1026,6 +1211,684 @@ impl canvas::Program<Message> for KlineChart {
             }
         }
     }
+}
+
+fn collect_close_series(
+    data_source: &PlotData<KlineDataPoint>,
+    earliest: u64,
+    latest: u64,
+) -> Vec<(u64, f32)> {
+    match data_source {
+        PlotData::TimeBased(timeseries) => {
+            if latest < earliest {
+                return vec![];
+            }
+            timeseries
+                .datapoints
+                .range(earliest..=latest)
+                .map(|(t, dp)| (*t, dp.kline.close.to_f32_lossy()))
+                .collect()
+        }
+        PlotData::TickBased(tick_aggr) => {
+            let earliest = earliest as usize;
+            let latest = latest as usize;
+            tick_aggr
+                .datapoints
+                .iter()
+                .rev()
+                .enumerate()
+                .filter(|(index, _)| *index <= latest && *index >= earliest)
+                .map(|(idx, dp)| (idx as u64, dp.kline.close.to_f32_lossy()))
+                .collect()
+        }
+    }
+}
+
+fn collect_kline_series(
+    data_source: &PlotData<KlineDataPoint>,
+    earliest: u64,
+    latest: u64,
+) -> Vec<(u64, f32, f32, f32, f32)> {
+    // (x, high, low, close, vol_total)
+    match data_source {
+        PlotData::TimeBased(timeseries) => {
+            if latest < earliest {
+                return vec![];
+            }
+            timeseries
+                .datapoints
+                .range(earliest..=latest)
+                .map(|(t, dp)| {
+                    let k = &dp.kline;
+                    (
+                        *t,
+                        k.high.to_f32_lossy(),
+                        k.low.to_f32_lossy(),
+                        k.close.to_f32_lossy(),
+                        k.volume.0 + k.volume.1,
+                    )
+                })
+                .collect()
+        }
+        PlotData::TickBased(tick_aggr) => {
+            let earliest = earliest as usize;
+            let latest = latest as usize;
+            tick_aggr
+                .datapoints
+                .iter()
+                .rev()
+                .enumerate()
+                .filter(|(index, _)| *index <= latest && *index >= earliest)
+                .map(|(idx, dp)| {
+                    let k = &dp.kline;
+                    (
+                        idx as u64,
+                        k.high.to_f32_lossy(),
+                        k.low.to_f32_lossy(),
+                        k.close.to_f32_lossy(),
+                        k.volume.0 + k.volume.1,
+                    )
+                })
+                .collect()
+        }
+    }
+}
+
+fn lerp_color(a: iced::Color, b: iced::Color, t: f32) -> iced::Color {
+    let t = t.clamp(0.0, 1.0);
+    iced::Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+fn compute_sma(values: &[f32], period: usize) -> Vec<Option<f32>> {
+    let mut out = vec![None; values.len()];
+    if period == 0 || values.len() < period {
+        return out;
+    }
+    let mut sum = 0.0f32;
+    for i in 0..values.len() {
+        sum += values[i];
+        if i >= period {
+            sum -= values[i - period];
+        }
+        if i + 1 >= period {
+            out[i] = Some(sum / period as f32);
+        }
+    }
+    out
+}
+
+fn compute_ema(values: &[f32], period: usize) -> Vec<Option<f32>> {
+    let mut out = vec![None; values.len()];
+    if values.is_empty() || period == 0 {
+        return out;
+    }
+    let k = 2.0 / (period as f32 + 1.0);
+    let mut prev = values[0];
+    out[0] = Some(prev);
+    for i in 1..values.len() {
+        prev = values[i] * k + prev * (1.0 - k);
+        out[i] = Some(prev);
+    }
+    out
+}
+
+fn draw_ma_line(
+    frame: &mut canvas::Frame,
+    xs: &[u64],
+    mas: &[Option<f32>],
+    interval_to_x: &impl Fn(u64) -> f32,
+    price_to_y: &impl Fn(Price) -> f32,
+    stroke: canvas::Stroke,
+) {
+    let mut prev: Option<(f32, f32)> = None;
+    for (i, &x) in xs.iter().enumerate() {
+        let Some(v) = mas.get(i).and_then(|v| *v) else {
+            prev = None;
+            continue;
+        };
+        let sx = interval_to_x(x);
+        let sy = price_to_y(Price::from_f32(v));
+        if let Some((px, py)) = prev {
+            frame.stroke(
+                &canvas::Path::line(iced::Point::new(px, py), iced::Point::new(sx, sy)),
+                stroke,
+            );
+        }
+        prev = Some((sx, sy));
+    }
+}
+
+fn draw_candle_studies(
+    frame: &mut canvas::Frame,
+    data_source: &PlotData<KlineDataPoint>,
+    studies: &[CandleStudy],
+    earliest: u64,
+    latest: u64,
+    interval_to_x: &impl Fn(u64) -> f32,
+    price_to_y: &impl Fn(Price) -> f32,
+    _palette: &Extended,
+) {
+    let series = collect_close_series(data_source, earliest, latest);
+    if series.is_empty() {
+        return;
+    }
+    let xs: Vec<u64> = series.iter().map(|(x, _)| *x).collect();
+    let closes: Vec<f32> = series.iter().map(|(_, c)| *c).collect();
+    let kseries = collect_kline_series(data_source, earliest, latest);
+
+    for study in studies {
+        match *study {
+            CandleStudy::MovingAverageFast {
+                kind,
+                period,
+                color_rgb,
+                ..
+            }
+            | CandleStudy::MovingAverageSlow {
+                kind,
+                period,
+                color_rgb,
+                ..
+            } => {
+                let period = (period as usize).max(2);
+                let mas = match kind {
+                    MovingAverageKind::SMA => compute_sma(&closes, period),
+                    MovingAverageKind::EMA => compute_ema(&closes, period),
+                };
+                let color = iced::Color::from_rgb8(color_rgb[0], color_rgb[1], color_rgb[2]);
+                let stroke = canvas::Stroke::default().with_color(color).with_width(1.2);
+                draw_ma_line(frame, &xs, &mas, interval_to_x, price_to_y, stroke);
+            }
+            CandleStudy::BollingerBands {
+                period,
+                stddev_x100,
+                mid_color_rgb,
+                upper_color_rgb,
+                lower_color_rgb,
+                ..
+            } => {
+                let period = (period as usize).max(2);
+                let mult = (stddev_x100.max(10).min(500) as f32) / 100.0;
+                let (mid, upper, lower) = compute_bbands(&closes, period, mult);
+
+                let mid_c = iced::Color::from_rgb8(mid_color_rgb[0], mid_color_rgb[1], mid_color_rgb[2]);
+                let up_c = iced::Color::from_rgb8(upper_color_rgb[0], upper_color_rgb[1], upper_color_rgb[2]);
+                let lo_c = iced::Color::from_rgb8(lower_color_rgb[0], lower_color_rgb[1], lower_color_rgb[2]);
+
+                let stroke_mid = canvas::Stroke::default().with_color(mid_c).with_width(1.1);
+                let stroke_up = canvas::Stroke::default().with_color(up_c).with_width(1.1);
+                let stroke_lo = canvas::Stroke::default().with_color(lo_c).with_width(1.1);
+
+                draw_ma_line(frame, &xs, &mid, interval_to_x, price_to_y, stroke_mid);
+                draw_ma_line(frame, &xs, &upper, interval_to_x, price_to_y, stroke_up);
+                draw_ma_line(frame, &xs, &lower, interval_to_x, price_to_y, stroke_lo);
+            }
+            CandleStudy::VwapBands {
+                reset_daily_utc,
+                band_stddev_x100,
+                vwap_color_rgb,
+                upper_color_rgb,
+                lower_color_rgb,
+                ..
+            } => {
+                // VWAP needs a real time axis; skip on tick-based charts.
+                if !matches!(data_source, PlotData::TimeBased(_)) {
+                    continue;
+                }
+
+                let sd = (band_stddev_x100.max(10).min(500) as f32) / 100.0;
+                let (vwap, upper, lower) = compute_vwap_bands(&kseries, reset_daily_utc, sd);
+
+                let vwap_c = iced::Color::from_rgb8(
+                    vwap_color_rgb[0],
+                    vwap_color_rgb[1],
+                    vwap_color_rgb[2],
+                );
+                let up_c = iced::Color::from_rgb8(
+                    upper_color_rgb[0],
+                    upper_color_rgb[1],
+                    upper_color_rgb[2],
+                );
+                let lo_c = iced::Color::from_rgb8(
+                    lower_color_rgb[0],
+                    lower_color_rgb[1],
+                    lower_color_rgb[2],
+                );
+
+                let stroke_v = canvas::Stroke::default().with_color(vwap_c).with_width(1.2);
+                let stroke_up = canvas::Stroke::default().with_color(up_c).with_width(1.0);
+                let stroke_lo = canvas::Stroke::default().with_color(lo_c).with_width(1.0);
+
+                draw_ma_line(frame, &xs, &vwap, interval_to_x, price_to_y, stroke_v);
+                draw_ma_line(frame, &xs, &upper, interval_to_x, price_to_y, stroke_up);
+                draw_ma_line(frame, &xs, &lower, interval_to_x, price_to_y, stroke_lo);
+            }
+            CandleStudy::Supertrend {
+                atr_period,
+                multiplier_x100,
+                up_color_rgb,
+                down_color_rgb,
+            } => {
+                let period = (atr_period as usize).max(2);
+                let mult = (multiplier_x100.max(50).min(1000) as f32) / 100.0;
+                let (up, down) = compute_supertrend(&kseries, period, mult);
+
+                let up_c = iced::Color::from_rgb8(
+                    up_color_rgb[0],
+                    up_color_rgb[1],
+                    up_color_rgb[2],
+                );
+                let dn_c = iced::Color::from_rgb8(
+                    down_color_rgb[0],
+                    down_color_rgb[1],
+                    down_color_rgb[2],
+                );
+                let stroke_up = canvas::Stroke::default().with_color(up_c).with_width(1.2);
+                let stroke_dn = canvas::Stroke::default().with_color(dn_c).with_width(1.2);
+
+                draw_ma_line(frame, &xs, &up, interval_to_x, price_to_y, stroke_up);
+                draw_ma_line(frame, &xs, &down, interval_to_x, price_to_y, stroke_dn);
+            }
+            CandleStudy::EmaRibbon {
+                min_period,
+                max_period,
+                step,
+                start_color_rgb,
+                end_color_rgb,
+            } => {
+                let min_p = (min_period as usize).max(2);
+                let max_p = (max_period as usize).max(min_p);
+                let step = (step as usize).max(1);
+
+                let count = ((max_p - min_p) / step).max(0) + 1;
+                let start = iced::Color::from_rgb8(
+                    start_color_rgb[0],
+                    start_color_rgb[1],
+                    start_color_rgb[2],
+                );
+                let end = iced::Color::from_rgb8(
+                    end_color_rgb[0],
+                    end_color_rgb[1],
+                    end_color_rgb[2],
+                );
+
+                for (idx, p) in (min_p..=max_p).step_by(step).enumerate() {
+                    let t = if count <= 1 {
+                        0.0
+                    } else {
+                        idx as f32 / (count as f32 - 1.0)
+                    };
+                    let c = lerp_color(start, end, t);
+                    let stroke = canvas::Stroke::default()
+                        .with_color(c.scale_alpha(0.85))
+                        .with_width(0.9);
+                    let ema = compute_ema(&closes, p);
+                    draw_ma_line(frame, &xs, &ema, interval_to_x, price_to_y, stroke);
+                }
+            }
+            CandleStudy::DonchianChannels {
+                period,
+                upper_color_rgb,
+                mid_color_rgb,
+                lower_color_rgb,
+            } => {
+                let period = (period as usize).max(2);
+                let (upper, mid, lower) = compute_donchian(&kseries, period);
+
+                let up_c = iced::Color::from_rgb8(upper_color_rgb[0], upper_color_rgb[1], upper_color_rgb[2]);
+                let mid_c = iced::Color::from_rgb8(mid_color_rgb[0], mid_color_rgb[1], mid_color_rgb[2]);
+                let lo_c = iced::Color::from_rgb8(lower_color_rgb[0], lower_color_rgb[1], lower_color_rgb[2]);
+
+                let stroke_up = canvas::Stroke::default().with_color(up_c).with_width(1.0);
+                let stroke_mid = canvas::Stroke::default().with_color(mid_c).with_width(1.0);
+                let stroke_lo = canvas::Stroke::default().with_color(lo_c).with_width(1.0);
+
+                draw_ma_line(frame, &xs, &upper, interval_to_x, price_to_y, stroke_up);
+                draw_ma_line(frame, &xs, &mid, interval_to_x, price_to_y, stroke_mid);
+                draw_ma_line(frame, &xs, &lower, interval_to_x, price_to_y, stroke_lo);
+            }
+            CandleStudy::KeltnerChannels {
+                ema_period,
+                atr_period,
+                multiplier_x100,
+                mid_color_rgb,
+                upper_color_rgb,
+                lower_color_rgb,
+            } => {
+                let ema_p = (ema_period as usize).max(2);
+                let atr_p = (atr_period as usize).max(2);
+                let mult = (multiplier_x100.max(50).min(1000) as f32) / 100.0;
+                let (mid, upper, lower) = compute_keltner(&kseries, &closes, ema_p, atr_p, mult);
+
+                let mid_c = iced::Color::from_rgb8(mid_color_rgb[0], mid_color_rgb[1], mid_color_rgb[2]);
+                let up_c = iced::Color::from_rgb8(upper_color_rgb[0], upper_color_rgb[1], upper_color_rgb[2]);
+                let lo_c = iced::Color::from_rgb8(lower_color_rgb[0], lower_color_rgb[1], lower_color_rgb[2]);
+
+                let stroke_mid = canvas::Stroke::default().with_color(mid_c).with_width(1.0);
+                let stroke_up = canvas::Stroke::default().with_color(up_c).with_width(1.0);
+                let stroke_lo = canvas::Stroke::default().with_color(lo_c).with_width(1.0);
+
+                draw_ma_line(frame, &xs, &mid, interval_to_x, price_to_y, stroke_mid);
+                draw_ma_line(frame, &xs, &upper, interval_to_x, price_to_y, stroke_up);
+                draw_ma_line(frame, &xs, &lower, interval_to_x, price_to_y, stroke_lo);
+            }
+            CandleStudy::Ichimoku {
+                tenkan_period,
+                kijun_period,
+                senkou_period,
+                tenkan_color_rgb,
+                kijun_color_rgb,
+                span_a_color_rgb,
+                span_b_color_rgb,
+                lag_color_rgb,
+            } => {
+                let tenkan_p = (tenkan_period as usize).max(2);
+                let kijun_p = (kijun_period as usize).max(2);
+                let senkou_p = (senkou_period as usize).max(2);
+                let (tenkan, kijun, span_a, span_b, lag) =
+                    compute_ichimoku(&kseries, kijun_p, tenkan_p, senkou_p);
+
+                let ten_c = iced::Color::from_rgb8(tenkan_color_rgb[0], tenkan_color_rgb[1], tenkan_color_rgb[2]);
+                let kij_c = iced::Color::from_rgb8(kijun_color_rgb[0], kijun_color_rgb[1], kijun_color_rgb[2]);
+                let a_c = iced::Color::from_rgb8(span_a_color_rgb[0], span_a_color_rgb[1], span_a_color_rgb[2]);
+                let b_c = iced::Color::from_rgb8(span_b_color_rgb[0], span_b_color_rgb[1], span_b_color_rgb[2]);
+                let lag_c = iced::Color::from_rgb8(lag_color_rgb[0], lag_color_rgb[1], lag_color_rgb[2]);
+
+                let s1 = canvas::Stroke::default().with_color(ten_c).with_width(1.0);
+                let s2 = canvas::Stroke::default().with_color(kij_c).with_width(1.0);
+                let s3 = canvas::Stroke::default().with_color(a_c.scale_alpha(0.9)).with_width(1.0);
+                let s4 = canvas::Stroke::default().with_color(b_c.scale_alpha(0.9)).with_width(1.0);
+                let s5 = canvas::Stroke::default().with_color(lag_c.scale_alpha(0.8)).with_width(0.9);
+
+                draw_ma_line(frame, &xs, &tenkan, interval_to_x, price_to_y, s1);
+                draw_ma_line(frame, &xs, &kijun, interval_to_x, price_to_y, s2);
+                draw_ma_line(frame, &xs, &span_a, interval_to_x, price_to_y, s3);
+                draw_ma_line(frame, &xs, &span_b, interval_to_x, price_to_y, s4);
+                draw_ma_line(frame, &xs, &lag, interval_to_x, price_to_y, s5);
+            }
+        }
+    }
+}
+
+fn compute_donchian(
+    series: &[(u64, f32, f32, f32, f32)],
+    period: usize,
+) -> (Vec<Option<f32>>, Vec<Option<f32>>, Vec<Option<f32>>) {
+    let mut upper = vec![None; series.len()];
+    let mut mid = vec![None; series.len()];
+    let mut lower = vec![None; series.len()];
+    if series.len() < period {
+        return (upper, mid, lower);
+    }
+    for i in 0..series.len() {
+        if i + 1 < period {
+            continue;
+        }
+        let start = i + 1 - period;
+        let mut hh = f32::MIN;
+        let mut ll = f32::MAX;
+        for j in start..=i {
+            hh = hh.max(series[j].1);
+            ll = ll.min(series[j].2);
+        }
+        upper[i] = Some(hh);
+        lower[i] = Some(ll);
+        mid[i] = Some((hh + ll) * 0.5);
+    }
+    (upper, mid, lower)
+}
+
+fn compute_keltner(
+    series: &[(u64, f32, f32, f32, f32)],
+    closes: &[f32],
+    ema_period: usize,
+    atr_period: usize,
+    mult: f32,
+) -> (Vec<Option<f32>>, Vec<Option<f32>>, Vec<Option<f32>>) {
+    let mid = compute_ema(closes, ema_period);
+    let atr = compute_atr_raw(series, atr_period);
+    let mut upper = vec![None; closes.len()];
+    let mut lower = vec![None; closes.len()];
+    for i in 0..closes.len() {
+        if let (Some(m), Some(a)) = (mid[i], atr[i]) {
+            upper[i] = Some(m + a * mult);
+            lower[i] = Some(m - a * mult);
+        }
+    }
+    (mid, upper, lower)
+}
+
+fn compute_ichimoku(
+    series: &[(u64, f32, f32, f32, f32)],
+    kijun_period: usize,
+    tenkan_period: usize,
+    senkou_period: usize,
+) -> (
+    Vec<Option<f32>>,
+    Vec<Option<f32>>,
+    Vec<Option<f32>>,
+    Vec<Option<f32>>,
+    Vec<Option<f32>>,
+) {
+    let mut tenkan = vec![None; series.len()];
+    let mut kijun = vec![None; series.len()];
+    let mut span_a = vec![None; series.len()];
+    let mut span_b = vec![None; series.len()];
+    let mut lag = vec![None; series.len()];
+
+    let hl_mid = |start: usize, end: usize, s: &[(u64, f32, f32, f32, f32)]| -> f32 {
+        let mut hh = f32::MIN;
+        let mut ll = f32::MAX;
+        for i in start..=end {
+            hh = hh.max(s[i].1);
+            ll = ll.min(s[i].2);
+        }
+        (hh + ll) * 0.5
+    };
+
+    for i in 0..series.len() {
+        if i + 1 >= tenkan_period {
+            tenkan[i] = Some(hl_mid(i + 1 - tenkan_period, i, series));
+        }
+        if i + 1 >= kijun_period {
+            kijun[i] = Some(hl_mid(i + 1 - kijun_period, i, series));
+        }
+        // Chikou span (lagging close) - shift back kijun_period
+        if i >= kijun_period {
+            lag[i - kijun_period] = Some(series[i].3);
+        }
+    }
+
+    // Senkou spans - shift forward kijun_period (best-effort inside visible window)
+    for i in 0..series.len() {
+        let fwd = i + kijun_period;
+        if fwd >= series.len() {
+            break;
+        }
+        if let (Some(t), Some(k)) = (tenkan[i], kijun[i]) {
+            span_a[fwd] = Some((t + k) * 0.5);
+        }
+        if i + 1 >= senkou_period {
+            span_b[fwd] = Some(hl_mid(i + 1 - senkou_period, i, series));
+        }
+    }
+
+    (tenkan, kijun, span_a, span_b, lag)
+}
+
+fn compute_bbands(values: &[f32], period: usize, stddev_mult: f32) -> (Vec<Option<f32>>, Vec<Option<f32>>, Vec<Option<f32>>) {
+    let mut mid = vec![None; values.len()];
+    let mut upper = vec![None; values.len()];
+    let mut lower = vec![None; values.len()];
+    if period == 0 || values.len() < period {
+        return (mid, upper, lower);
+    }
+
+    let mut sum = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    for i in 0..values.len() {
+        let v = values[i];
+        sum += v;
+        sum_sq += v * v;
+
+        if i >= period {
+            let old = values[i - period];
+            sum -= old;
+            sum_sq -= old * old;
+        }
+
+        if i + 1 >= period {
+            let mean = sum / period as f32;
+            let var = (sum_sq / period as f32) - mean * mean;
+            let sd = var.max(0.0).sqrt();
+            mid[i] = Some(mean);
+            upper[i] = Some(mean + sd * stddev_mult);
+            lower[i] = Some(mean - sd * stddev_mult);
+        }
+    }
+    (mid, upper, lower)
+}
+
+fn compute_vwap_bands(
+    series: &[(u64, f32, f32, f32, f32)],
+    reset_daily_utc: bool,
+    band_stddev: f32,
+) -> (Vec<Option<f32>>, Vec<Option<f32>>, Vec<Option<f32>>) {
+    let mut vwap = vec![None; series.len()];
+    let mut upper = vec![None; series.len()];
+    let mut lower = vec![None; series.len()];
+
+    let mut sum_pv = 0.0f32;
+    let mut sum_v = 0.0f32;
+
+    // Welford stdev of typical price inside the same reset window
+    let mut mean = 0.0f32;
+    let mut m2 = 0.0f32;
+    let mut count = 0u32;
+
+    let mut last_day: Option<i64> = None;
+    for (i, (t, high, low, close, vol)) in series.iter().copied().enumerate() {
+        if reset_daily_utc {
+            // millis -> day index
+            let day = (t as i64 / 86_400_000) as i64;
+            if last_day.is_some_and(|d| d != day) {
+                sum_pv = 0.0;
+                sum_v = 0.0;
+                mean = 0.0;
+                m2 = 0.0;
+                count = 0;
+            }
+            last_day = Some(day);
+        }
+
+        if vol <= 0.0 {
+            continue;
+        }
+
+        let tp = (high + low + close) / 3.0;
+        sum_pv += tp * vol;
+        sum_v += vol;
+
+        count += 1;
+        let delta = tp - mean;
+        mean += delta / count as f32;
+        let delta2 = tp - mean;
+        m2 += delta * delta2;
+        let variance = if count > 1 { m2 / (count as f32) } else { 0.0 };
+        let sd = variance.max(0.0).sqrt();
+
+        if sum_v > 0.0 {
+            let cur = sum_pv / sum_v;
+            vwap[i] = Some(cur);
+            upper[i] = Some(cur + sd * band_stddev);
+            lower[i] = Some(cur - sd * band_stddev);
+        }
+    }
+
+    (vwap, upper, lower)
+}
+
+fn compute_atr_raw(series: &[(u64, f32, f32, f32, f32)], period: usize) -> Vec<Option<f32>> {
+    let mut out = vec![None; series.len()];
+    if series.len() < period + 1 || period == 0 {
+        return out;
+    }
+
+    let mut trs = vec![0.0f32; series.len()];
+    trs[0] = series[0].1 - series[0].2;
+    for i in 1..series.len() {
+        let (_t, high, low, _close, _vol) = series[i];
+        let prev_close = series[i - 1].3;
+        trs[i] = (high - low)
+            .max((high - prev_close).abs())
+            .max((low - prev_close).abs());
+    }
+
+    let mut atr = 0.0f32;
+    for i in 0..period {
+        atr += trs[i];
+    }
+    atr /= period as f32;
+    out[period - 1] = Some(atr);
+    for i in period..trs.len() {
+        atr = (atr * (period as f32 - 1.0) + trs[i]) / period as f32;
+        out[i] = Some(atr);
+    }
+    out
+}
+
+fn compute_supertrend(
+    series: &[(u64, f32, f32, f32, f32)],
+    atr_period: usize,
+    multiplier: f32,
+) -> (Vec<Option<f32>>, Vec<Option<f32>>) {
+    let atr = compute_atr_raw(series, atr_period);
+    let mut up = vec![None; series.len()];
+    let mut down = vec![None; series.len()];
+
+    let mut final_upper = 0.0f32;
+    let mut final_lower = 0.0f32;
+    let mut trend_up = true;
+
+    for i in 0..series.len() {
+        let (_t, high, low, close, _vol) = series[i];
+        let Some(a) = atr[i] else { continue; };
+        let hl2 = (high + low) / 2.0;
+        let basic_upper = hl2 + multiplier * a;
+        let basic_lower = hl2 - multiplier * a;
+
+        if i == 0 || atr[i - 1].is_none() {
+            final_upper = basic_upper;
+            final_lower = basic_lower;
+            trend_up = true;
+        } else {
+            if basic_upper < final_upper || series[i - 1].3 > final_upper {
+                final_upper = basic_upper;
+            }
+            if basic_lower > final_lower || series[i - 1].3 < final_lower {
+                final_lower = basic_lower;
+            }
+
+            if close > final_upper {
+                trend_up = true;
+            } else if close < final_lower {
+                trend_up = false;
+            }
+        }
+
+        if trend_up {
+            up[i] = Some(final_lower);
+        } else {
+            down[i] = Some(final_upper);
+        }
+    }
+
+    (up, down)
 }
 
 fn draw_footprint_kline(

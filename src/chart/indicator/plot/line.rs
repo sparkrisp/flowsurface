@@ -18,6 +18,7 @@ pub struct LinePlot<V, T> {
     pub stroke_width: f32,
     pub show_points: bool,
     pub point_radius_factor: f32,
+    pub color: Option<iced::Color>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -32,6 +33,7 @@ impl<V, T> LinePlot<V, T> {
             stroke_width: 1.0,
             show_points: true,
             point_radius_factor: 0.2,
+            color: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -56,6 +58,11 @@ impl<V, T> LinePlot<V, T> {
     /// as a factor of cell width, e.g. 0.2 means 20% of cell width, capped at 5px
     pub fn point_radius_factor(mut self, f: f32) -> Self {
         self.point_radius_factor = f;
+        self
+    }
+
+    pub fn color(mut self, c: iced::Color) -> Self {
+        self.color = Some(c);
         self
     }
 
@@ -114,7 +121,7 @@ where
         scale: &YScale,
     ) {
         let palette = theme.extended_palette();
-        let color = palette.secondary.strong.color;
+        let color = self.color.unwrap_or(palette.secondary.strong.color);
 
         let stroke = Stroke::with_color(
             Stroke {

@@ -23,7 +23,8 @@ pub enum Message {
 }
 
 pub struct AudioStream {
-    cache: SoundCache,
+    cache: Option<SoundCache>,
+    cache_error: Option<String>,
     streams: HashMap<Exchange, HashMap<exchange::Ticker, StreamCfg>>,
     expanded_card: Option<(Exchange, exchange::Ticker)>,
 }
@@ -42,9 +43,19 @@ impl AudioStream {
                 .insert(ticker, stream_cfg);
         }
 
+        let (cache, cache_error) = match SoundCache::with_default_sounds(cfg.volume) {
+            Ok(c) => (Some(c), None),
+            Err(err) => {
+                log::warn!(
+                    "Audio disabled: failed to initialize output device/sounds: {err}"
+                );
+                (None, Some(err))
+            }
+        };
+
         AudioStream {
-            cache: SoundCache::with_default_sounds(cfg.volume)
-                .expect("Failed to create sound cache"),
+            cache,
+            cache_error,
             streams,
             expanded_card: None,
         }
@@ -53,7 +64,9 @@ impl AudioStream {
     pub fn update(&mut self, message: Message) {
         match message {
             Message::SoundLevelChanged(value) => {
-                self.cache.set_volume(value);
+                if let Some(cache) = &mut self.cache {
+                    cache.set_volume(value);
+                }
             }
             Message::ToggleStream(is_checked, (exchange, ticker)) => {
                 if is_checked {
@@ -102,7 +115,11 @@ impl AudioStream {
     ) -> Element<'_, Message> {
         let volume_container = {
             let volume_slider = {
-                let volume_pct = self.cache.get_volume().unwrap_or(0.0);
+                let volume_pct = self
+                    .cache
+                    .as_ref()
+                    .and_then(|c| c.get_volume())
+                    .unwrap_or(0.0);
 
                 labeled_slider(
                     "Volume",
@@ -114,7 +131,14 @@ impl AudioStream {
                 )
             };
 
-            column![text("Sound").size(14), volume_slider,].spacing(8)
+            let mut col = column![text("Sound").size(14), volume_slider].spacing(8);
+            if self.cache.is_none() {
+                col = col.push(text("Audio output not available (disabled)").size(12));
+                if let Some(err) = self.cache_error.as_deref() {
+                    col = col.push(text(err).size(11));
+                }
+            }
+            col
         };
 
         let audio_contents = {
@@ -230,11 +254,14 @@ impl AudioStream {
     }
 
     pub fn volume(&self) -> Option<f32> {
-        self.cache.get_volume()
+        self.cache.as_ref().and_then(|c| c.get_volume())
     }
 
     pub fn play(&mut self, sound: SoundType) -> Result<(), String> {
-        self.cache.play(sound)
+        let Some(cache) = &mut self.cache else {
+            return Ok(());
+        };
+        cache.play(sound)
     }
 
     pub fn is_stream_audio_enabled(&self, stream: &StreamKind) -> bool {
@@ -249,7 +276,10 @@ impl AudioStream {
     }
 
     pub fn should_play_sound(&self, stream: &StreamKind) -> Option<StreamCfg> {
-        if self.cache.is_muted() {
+        let Some(cache) = self.cache.as_ref() else {
+            return None;
+        };
+        if cache.is_muted() {
             return None;
         }
 
@@ -339,7 +369,7 @@ impl From<&AudioStream> for data::AudioStream {
         }
 
         data::AudioStream {
-            volume: audio_stream.cache.get_volume(),
+            volume: audio_stream.cache.as_ref().and_then(|c| c.get_volume()),
             streams,
         }
     }

@@ -16,6 +16,7 @@ pub mod color_picker;
 pub mod column_drag;
 pub mod decorate;
 pub mod multi_split;
+pub mod resize_box;
 pub mod toast;
 
 #[allow(dead_code)]

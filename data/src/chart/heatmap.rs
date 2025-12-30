@@ -1,7 +1,7 @@
 use super::Basis;
 use super::aggr::time::DataPoint;
 use exchange::util::{Price, PriceStep};
-use exchange::{adapter::MarketKind, depth::Depth, volume_size_unit};
+use exchange::{adapter::MarketKind, depth::Depth, volume_size_unit, Timeframe};
 
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,12 @@ pub struct Config {
     pub order_size_filter: f32,
     pub trade_size_scale: Option<i32>,
     pub coalescing: Option<CoalesceKind>,
+    /// Draw candlesticks over the orderbook heatmap (requires kline stream).
+    #[serde(default)]
+    pub show_candles: bool,
+    /// Overrides the kline timeframe used for the candle overlay.
+    #[serde(default)]
+    pub candle_timeframe: Option<Timeframe>,
 }
 
 impl Default for Config {
@@ -28,7 +34,25 @@ impl Default for Config {
             order_size_filter: 0.0,
             trade_size_scale: Some(100),
             coalescing: Some(CoalesceKind::Average(0.15)),
+            show_candles: false,
+            candle_timeframe: None,
         }
+    }
+}
+
+pub fn default_candle_timeframe(heatmap_timeframe: Timeframe) -> Timeframe {
+    match heatmap_timeframe {
+        Timeframe::M1
+        | Timeframe::M3
+        | Timeframe::M5
+        | Timeframe::M15
+        | Timeframe::M30
+        | Timeframe::H1
+        | Timeframe::H2
+        | Timeframe::H4
+        | Timeframe::H12
+        | Timeframe::D1 => heatmap_timeframe,
+        _ => Timeframe::M5,
     }
 }
 

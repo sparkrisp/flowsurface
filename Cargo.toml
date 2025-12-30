@@ -30,7 +30,7 @@ palette = "0.7.6"
 num-traits = "0.2.19"
 rustc-hash = "2.1.1"
 enum-map = "2.7.3"
-uuid = { version = "1.11.0", features = ["v4"] }
+uuid = { version = "1.11.0", features = ["v4", "serde"] }
 
 [dependencies]
 iced = { version = "0.14.0", default-features = false, features = [
@@ -58,6 +58,7 @@ rustc-hash.workspace = true
 enum-map.workspace = true
 fern = "0.7.1"
 rodio = { version = "0.20.1", default-features = false, features = [ "wav" ]}
+reqwest = { version = "0.12.9", default-features = false, features = ["json", "brotli", "rustls-tls"] }
 
 exchange = { version = "0.1.0", path = "exchange", package = "flowsurface-exchange" }
 data = { version = "0.1.0", path = "data", package = "flowsurface-data" }

@@ -481,10 +481,11 @@ pub fn chart_modal(theme: &Theme) -> Style {
             color: palette.background.weak.color,
             radius: 4.0.into(),
         },
+        // Shadows scale poorly with UI scale / window resize (can turn into a big "smudge").
+        // Prefer borders only to avoid artifacts.
         shadow: Shadow {
-            offset: iced::Vector { x: 0.0, y: 0.0 },
-            blur_radius: 12.0,
-            color: Color::BLACK.scale_alpha(if palette.is_dark { 0.4 } else { 0.2 }),
+            color: Color::TRANSPARENT,
+            ..Default::default()
         },
         snap: true,
     }
@@ -507,9 +508,8 @@ pub fn dashboard_modal(theme: &Theme) -> Style {
             radius: 4.0.into(),
         },
         shadow: Shadow {
-            offset: iced::Vector { x: 0.0, y: 0.0 },
-            blur_radius: 20.0,
-            color: Color::BLACK.scale_alpha(if palette.is_dark { 0.8 } else { 0.4 }),
+            color: Color::TRANSPARENT,
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -527,9 +527,8 @@ pub fn modal_container(theme: &Theme) -> Style {
             radius: 4.0.into(),
         },
         shadow: Shadow {
-            offset: iced::Vector { x: 0.0, y: 0.0 },
-            blur_radius: 2.0,
-            color: Color::BLACK.scale_alpha(if palette.is_dark { 0.8 } else { 0.2 }),
+            color: Color::TRANSPARENT,
+            ..Default::default()
         },
         snap: true,
     }
@@ -564,9 +563,8 @@ pub fn dragger_row_container(theme: &Theme) -> Style {
             radius: 4.0.into(),
         },
         shadow: Shadow {
-            offset: iced::Vector { x: 0.0, y: 0.0 },
-            blur_radius: 4.0,
-            color: Color::BLACK.scale_alpha(if palette.is_dark { 0.8 } else { 0.2 }),
+            color: Color::TRANSPARENT,
+            ..Default::default()
         },
         snap: true,
     }
