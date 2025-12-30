@@ -291,16 +291,18 @@ pub fn heatmap_cfg_view<'a>(
             data::chart::Basis::Time(tf) => {
                 let default_tf = heatmap::default_candle_timeframe(tf);
                 let selected_tf = cfg.candle_timeframe.unwrap_or(default_tf);
-                let picker = pick_list(Timeframe::KLINE, Some(selected_tf), move |new_tf| {
-                    Message::VisualConfigChanged(
-                        pane,
-                        VisualConfig::Heatmap(heatmap::Config {
-                            candle_timeframe: Some(new_tf),
-                            ..cfg
-                        }),
-                        false,
-                    )
-                });
+                let picker: Element<'a, Message> =
+                    pick_list(Timeframe::KLINE, Some(selected_tf), move |new_tf| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Heatmap(heatmap::Config {
+                                candle_timeframe: Some(new_tf),
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    })
+                    .into();
                 Some(column![text("Candle timeframe").size(12), picker].spacing(6).into())
             }
             data::chart::Basis::Tick(_) => None,
