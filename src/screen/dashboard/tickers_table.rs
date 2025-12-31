@@ -42,7 +42,7 @@ const SORT_AND_FILTER_HEIGHT: f32 = 200.0;
 
 const COMPACT_ROW_HEIGHT: f32 = 28.0;
 
-const EXCHANGE_FILTERS: [(ExchangeInclusive, Exchange, &str); 4] = [
+const EXCHANGE_FILTERS: [(ExchangeInclusive, Exchange, &str); 6] = [
     (ExchangeInclusive::Bybit, Exchange::BybitLinear, "Bybit"),
     (
         ExchangeInclusive::Binance,
@@ -54,6 +54,8 @@ const EXCHANGE_FILTERS: [(ExchangeInclusive, Exchange, &str); 4] = [
         Exchange::HyperliquidLinear,
         "Hyperliquid",
     ),
+    (ExchangeInclusive::Oanda, Exchange::OandaFx, "OANDA"),
+    (ExchangeInclusive::TwelveData, Exchange::TwelveDataFx, "Twelve Data"),
     (ExchangeInclusive::Okex, Exchange::OkexLinear, "OKX"),
 ];
 

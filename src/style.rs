@@ -107,6 +107,8 @@ pub fn exchange_icon(exchange: Exchange) -> Icon {
             Icon::BinanceLogo
         }
         Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => Icon::HyperliquidLogo,
+        Exchange::OandaFx => Icon::ChartOutline,
+        Exchange::TwelveDataFx => Icon::ChartOutline,
         Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => Icon::OkexLogo,
     }
 }

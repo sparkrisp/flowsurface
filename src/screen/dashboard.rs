@@ -25,7 +25,7 @@ use exchange::{
     Kline, PushFrequency, StreamPairKind, TickMultiplier, TickerInfo, Timeframe, Trade,
     adapter::{
         self, AdapterError, Exchange, PersistStreamKind, ResolvedStream, StreamConfig, StreamKind,
-        StreamTicksize, UniqueStreams, binance, bybit, hyperliquid, okex,
+        StreamTicksize, UniqueStreams, binance, bybit, hyperliquid, oanda, okex, twelvedata,
     },
     depth::Depth,
     fetcher::{FetchRange, FetchedData},
@@ -2162,6 +2162,17 @@ pub fn depth_subscription(
             };
             Subscription::run_with(config, builder)
         }
+        Exchange::OandaFx => {
+            let builder =
+                |cfg: &StreamConfig<TickerInfo>| oanda::connect_market_stream(cfg.id, cfg.push_freq);
+            Subscription::run_with(config, builder)
+        }
+        Exchange::TwelveDataFx => {
+            let builder = |cfg: &StreamConfig<TickerInfo>| {
+                twelvedata::connect_market_stream(cfg.id, cfg.push_freq)
+            };
+            Subscription::run_with(config, builder)
+        }
         Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
             let builder =
                 |cfg: &StreamConfig<TickerInfo>| okex::connect_market_stream(cfg.id, cfg.push_freq);
@@ -2191,6 +2202,18 @@ pub fn kline_subscription(
         Exchange::HyperliquidSpot | Exchange::HyperliquidLinear => {
             let builder = |cfg: &StreamConfig<Vec<(TickerInfo, Timeframe)>>| {
                 hyperliquid::connect_kline_stream(cfg.id.clone(), cfg.market_type)
+            };
+            Subscription::run_with(config, builder)
+        }
+        Exchange::OandaFx => {
+            let builder = |cfg: &StreamConfig<Vec<(TickerInfo, Timeframe)>>| {
+                oanda::connect_kline_stream(cfg.id.clone(), cfg.market_type)
+            };
+            Subscription::run_with(config, builder)
+        }
+        Exchange::TwelveDataFx => {
+            let builder = |cfg: &StreamConfig<Vec<(TickerInfo, Timeframe)>>| {
+                twelvedata::connect_kline_stream(cfg.id.clone(), cfg.market_type)
             };
             Subscription::run_with(config, builder)
         }

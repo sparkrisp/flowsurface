@@ -12,6 +12,8 @@ use std::{collections::HashMap, str::FromStr, sync::Arc};
 pub mod binance;
 pub mod bybit;
 pub mod hyperliquid;
+pub mod oanda;
+pub mod twelvedata;
 pub mod okex;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -422,14 +424,18 @@ pub enum ExchangeInclusive {
     Bybit,
     Binance,
     Hyperliquid,
+    Oanda,
+    TwelveData,
     Okex,
 }
 
 impl ExchangeInclusive {
-    pub const ALL: [ExchangeInclusive; 4] = [
+    pub const ALL: [ExchangeInclusive; 6] = [
         ExchangeInclusive::Bybit,
         ExchangeInclusive::Binance,
         ExchangeInclusive::Hyperliquid,
+        ExchangeInclusive::Oanda,
+        ExchangeInclusive::TwelveData,
         ExchangeInclusive::Okex,
     ];
 
@@ -440,6 +446,8 @@ impl ExchangeInclusive {
                 Self::Binance
             }
             Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => Self::Hyperliquid,
+            Exchange::OandaFx => Self::Oanda,
+            Exchange::TwelveDataFx => Self::TwelveData,
             Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => Self::Okex,
         }
     }
@@ -455,6 +463,8 @@ pub enum Exchange {
     BybitSpot,
     HyperliquidLinear,
     HyperliquidSpot,
+    OandaFx,
+    TwelveDataFx,
     OkexLinear,
     OkexInverse,
     OkexSpot,
@@ -474,6 +484,8 @@ impl std::fmt::Display for Exchange {
                 Exchange::BybitSpot => "Bybit Spot",
                 Exchange::HyperliquidLinear => "Hyperliquid Linear",
                 Exchange::HyperliquidSpot => "Hyperliquid Spot",
+                Exchange::OandaFx => "OANDA FX",
+                Exchange::TwelveDataFx => "Twelve Data FX",
                 Exchange::OkexLinear => "Okex Linear",
                 Exchange::OkexInverse => "Okex Inverse",
                 Exchange::OkexSpot => "Okex Spot",
@@ -495,6 +507,8 @@ impl FromStr for Exchange {
             "Bybit Spot" => Ok(Exchange::BybitSpot),
             "Hyperliquid Linear" => Ok(Exchange::HyperliquidLinear),
             "Hyperliquid Spot" => Ok(Exchange::HyperliquidSpot),
+            "OANDA FX" => Ok(Exchange::OandaFx),
+            "Twelve Data FX" => Ok(Exchange::TwelveDataFx),
             "Okex Linear" => Ok(Exchange::OkexLinear),
             "Okex Inverse" => Ok(Exchange::OkexInverse),
             "Okex Spot" => Ok(Exchange::OkexSpot),
@@ -504,7 +518,7 @@ impl FromStr for Exchange {
 }
 
 impl Exchange {
-    pub const ALL: [Exchange; 11] = [
+    pub const ALL: [Exchange; 13] = [
         Exchange::BinanceLinear,
         Exchange::BinanceInverse,
         Exchange::BinanceSpot,
@@ -513,6 +527,8 @@ impl Exchange {
         Exchange::BybitSpot,
         Exchange::HyperliquidLinear,
         Exchange::HyperliquidSpot,
+        Exchange::OandaFx,
+        Exchange::TwelveDataFx,
         Exchange::OkexLinear,
         Exchange::OkexInverse,
         Exchange::OkexSpot,
@@ -530,6 +546,8 @@ impl Exchange {
             Exchange::BinanceSpot
             | Exchange::BybitSpot
             | Exchange::HyperliquidSpot
+            | Exchange::OandaFx
+            | Exchange::TwelveDataFx
             | Exchange::OkexSpot => MarketKind::Spot,
         }
     }
@@ -569,6 +587,8 @@ impl Exchange {
             Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
                 tf != Timeframe::MS100 && tf != Timeframe::MS200 && tf != Timeframe::MS300
             }
+            Exchange::OandaFx => false,
+            Exchange::TwelveDataFx => false,
             _ => true,
         }
     }
@@ -637,63 +657,69 @@ pub async fn fetch_ticker_info(
 ) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError> {
     let market_type = exchange.market_type();
 
-    match exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_ticksize(market_type).await
-        }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_ticksize(market_type).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_ticksize(market_type).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_ticksize(market_type).await
+        match exchange {
+            Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
+                binance::fetch_ticksize(market_type).await
+            }
+            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
+                bybit::fetch_ticksize(market_type).await
+            }
+            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
+                hyperliquid::fetch_ticksize(market_type).await
+            }
+            Exchange::OandaFx => oanda::fetch_ticker_info(market_type).await,
+            Exchange::TwelveDataFx => twelvedata::fetch_ticker_info(market_type).await,
+            Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
+                okex::fetch_ticksize(market_type).await
+            }
         }
     }
-}
 
 pub async fn fetch_ticker_prices(
     exchange: Exchange,
 ) -> Result<HashMap<Ticker, TickerStats>, AdapterError> {
     let market_type = exchange.market_type();
 
-    match exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_ticker_prices(market_type).await
-        }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_ticker_prices(market_type).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_ticker_prices(market_type).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_ticker_prices(market_type).await
+        match exchange {
+            Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
+                binance::fetch_ticker_prices(market_type).await
+            }
+            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
+                bybit::fetch_ticker_prices(market_type).await
+            }
+            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
+                hyperliquid::fetch_ticker_prices(market_type).await
+            }
+            Exchange::OandaFx => oanda::fetch_ticker_prices(market_type).await,
+            Exchange::TwelveDataFx => twelvedata::fetch_ticker_prices(market_type).await,
+            Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
+                okex::fetch_ticker_prices(market_type).await
+            }
         }
     }
-}
 
 pub async fn fetch_klines(
     ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(u64, u64)>,
 ) -> Result<Vec<Kline>, AdapterError> {
-    match ticker_info.ticker.exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_klines(ticker_info, timeframe, range).await
+        match ticker_info.ticker.exchange {
+            Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
+                binance::fetch_klines(ticker_info, timeframe, range).await
+            }
+            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
+                bybit::fetch_klines(ticker_info, timeframe, range).await
+            }
+            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
+                hyperliquid::fetch_klines(ticker_info, timeframe, range).await
+            }
+            Exchange::OandaFx => oanda::fetch_klines(ticker_info, timeframe, range).await,
+            Exchange::TwelveDataFx => twelvedata::fetch_klines(ticker_info, timeframe, range).await,
+            Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
+                okex::fetch_klines(ticker_info, timeframe, range).await
+            }
         }
     }
-}
 
 pub async fn fetch_open_interest(
     ticker: Ticker,
