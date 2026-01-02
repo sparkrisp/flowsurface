@@ -34,7 +34,7 @@ use iced::{
 use std::{borrow::Cow, collections::HashMap, vec};
 
 fn main() {
-    let _ = dotenvy::dotenv();
+    load_dotenv();
     maybe_silence_stdio();
     logger::setup(cfg!(debug_assertions)).expect("Failed to initialize logger");
 
@@ -55,6 +55,15 @@ fn main() {
         .scale_factor(Flowsurface::scale_factor)
         .subscription(Flowsurface::subscription)
         .run();
+}
+
+fn load_dotenv() {
+    let _ = dotenvy::dotenv();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let _ = dotenvy::from_path_override(dir.join(".env"));
+        }
+    }
 }
 
 fn maybe_silence_stdio() {
