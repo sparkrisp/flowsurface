@@ -35,6 +35,7 @@ use std::{borrow::Cow, collections::HashMap, vec};
 
 fn main() {
     let _ = dotenvy::dotenv();
+    maybe_silence_stdio();
     logger::setup(cfg!(debug_assertions)).expect("Failed to initialize logger");
 
     std::thread::spawn(data::cleanup_old_market_data);
@@ -54,6 +55,35 @@ fn main() {
         .scale_factor(Flowsurface::scale_factor)
         .subscription(Flowsurface::subscription)
         .run();
+}
+
+fn maybe_silence_stdio() {
+    if !env_flag_enabled("FLOWSURFACE_SILENCE_STDIO") {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+            let fd = devnull.as_raw_fd();
+            unsafe {
+                libc::dup2(fd, libc::STDOUT_FILENO);
+                libc::dup2(fd, libc::STDERR_FILENO);
+            }
+        }
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    let Ok(value) = std::env::var(name) else {
+        return false;
+    };
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 struct Flowsurface {

@@ -1148,6 +1148,7 @@ dependencies = [
  "iced",
  "iced_core",
  "iced_futures",
+ "libc",
  "log",
  "num-traits",
  "palette",
