@@ -35,6 +35,7 @@ use std::{borrow::Cow, collections::HashMap, vec};
 
 fn main() {
     load_dotenv();
+    normalize_window_backend_env();
     maybe_silence_stdio();
     logger::setup(cfg!(debug_assertions)).expect("Failed to initialize logger");
 
@@ -63,6 +64,22 @@ fn load_dotenv() {
         if let Some(dir) = exe.parent() {
             let _ = dotenvy::from_path_override(dir.join(".env"));
         }
+    }
+}
+
+fn normalize_window_backend_env() {
+    let Ok(raw) = std::env::var("WINIT_UNIX_BACKEND") else {
+        return;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "x11" => unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+            std::env::remove_var("WAYLAND_SOCKET");
+        },
+        "wayland" => unsafe {
+            std::env::remove_var("DISPLAY");
+        },
+        _ => {}
     }
 }
 
