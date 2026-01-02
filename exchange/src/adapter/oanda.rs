@@ -9,7 +9,7 @@ use super::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use iced_futures::{
-    futures::{Stream, StreamExt},
+    futures::{SinkExt, Stream, StreamExt},
     stream,
 };
 use serde::Deserialize;

@@ -2,6 +2,7 @@ use super::{
     super::{
         Exchange, Kline, MarketKind, PushFrequency, StreamKind, Ticker, TickerInfo, TickerStats,
         Timeframe,
+        connect::connect_ws,
     },
     AdapterError, Event,
 };
@@ -9,7 +10,7 @@ use super::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fastwebsockets::Frame;
 use iced_futures::{
-    futures::Stream,
+    futures::{SinkExt, Stream},
     stream,
 };
 use serde::Deserialize;
@@ -374,7 +375,7 @@ pub fn connect_kline_stream(
 
         loop {
             let url = format!("{WS_URL}?apikey={}", cfg.api_key);
-            match super::connect::connect_ws(WS_DOMAIN, &url).await {
+            match connect_ws(WS_DOMAIN, &url).await {
                 Ok(mut websocket) => {
                     let _ = websocket
                         .write_frame(Frame::text(fastwebsockets::Payload::Borrowed(

@@ -34,6 +34,7 @@ use iced::{
 use std::{borrow::Cow, collections::HashMap, vec};
 
 fn main() {
+    let _ = dotenvy::dotenv();
     logger::setup(cfg!(debug_assertions)).expect("Failed to initialize logger");
 
     std::thread::spawn(data::cleanup_old_market_data);

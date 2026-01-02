@@ -31,6 +31,7 @@ pub struct AudioStream {
 
 impl AudioStream {
     pub fn new(cfg: data::AudioStream) -> Self {
+        let disable_audio = audio_disabled_by_env();
         let mut streams: HashMap<Exchange, HashMap<exchange::Ticker, StreamCfg>> = HashMap::new();
 
         for (exchange_ticker, stream_cfg) in cfg.streams {
@@ -43,13 +44,20 @@ impl AudioStream {
                 .insert(ticker, stream_cfg);
         }
 
-        let (cache, cache_error) = match SoundCache::with_default_sounds(cfg.volume) {
-            Ok(c) => (Some(c), None),
-            Err(err) => {
-                log::warn!(
-                    "Audio disabled: failed to initialize output device/sounds: {err}"
-                );
-                (None, Some(err))
+        let (cache, cache_error) = if disable_audio {
+            (
+                None,
+                Some("Audio disabled by FLOWSURFACE_DISABLE_AUDIO".to_string()),
+            )
+        } else {
+            match SoundCache::with_default_sounds(cfg.volume) {
+                Ok(c) => (Some(c), None),
+                Err(err) => {
+                    log::warn!(
+                        "Audio disabled: failed to initialize output device/sounds: {err}"
+                    );
+                    (None, Some(err))
+                }
             }
         };
 
@@ -355,6 +363,16 @@ impl AudioStream {
 
         Ok(())
     }
+}
+
+fn audio_disabled_by_env() -> bool {
+    let Ok(value) = std::env::var("FLOWSURFACE_DISABLE_AUDIO") else {
+        return false;
+    };
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 impl From<&AudioStream> for data::AudioStream {
