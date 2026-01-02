@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use crate::data_path;
@@ -17,11 +17,22 @@ pub fn file() -> Result<fs::File, Error> {
 }
 
 pub fn path() -> Result<PathBuf, Error> {
-    let full_path = data_path(Some(LOG_FILE));
+    if let Ok(path) = std::env::var("FLOWSURFACE_LOG_PATH") {
+        return ensure_parent(PathBuf::from(path));
+    }
 
+    if let Ok(dir) = std::env::var("FLOWSURFACE_LOG_DIR") {
+        return ensure_parent(PathBuf::from(dir).join(LOG_FILE));
+    }
+
+    let full_path = data_path(Some(LOG_FILE));
+    ensure_parent(full_path)
+}
+
+fn ensure_parent(full_path: PathBuf) -> Result<PathBuf, Error> {
     let parent = full_path
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid log file path"))?;
+        .unwrap_or_else(|| Path::new("."));
 
     if !parent.exists() {
         fs::create_dir_all(parent)?;
